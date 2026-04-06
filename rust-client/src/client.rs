@@ -1,3 +1,4 @@
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,11 +94,54 @@ impl HubSyncClient {
         self.sync_once_cb(cancel, &mut |_| {})
     }
 
+    /// Bootstrap by fetching the tree DB from /snapshots-tree/latest.
+    /// Replaces the local hub_tree and sync_state with the hub's current state.
+    /// Only needed on first sync (hub_version == 0).
+    fn bootstrap(&self) -> Result<()> {
+        let url = format!("{}/snapshots-tree/latest", self.hub_url);
+        let mut req = self.http.get(&url);
+        if let Some(ref token) = self.token {
+            req = req.header(AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let resp = req.send()?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            return Err(Error::Other(format!("bootstrap tree db {}: {}", status, body)));
+        }
+
+        // Write to a temp file, then import into our store
+        let mut data = Vec::new();
+        resp.bytes()?.as_ref().read_to_end(&mut data)?;
+
+        let tmp_path = format!("{}.bootstrap.tmp", self.store.db_path());
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(&data)?;
+        }
+
+        // Import the tree from the downloaded DB
+        self.store.import_tree_db(&tmp_path)?;
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let version = self.store.hub_version()?;
+        eprintln!("bootstrap complete, version={}", version);
+        Ok(())
+    }
+
     fn sync_once_cb(
         &self,
         cancel: &Arc<AtomicBool>,
         on_event: &mut impl FnMut(&crate::proto::SyncEvent),
     ) -> Result<()> {
+        let version = self.store.hub_version()?;
+
+        // Bootstrap on first sync instead of replaying from version 0
+        if version == 0 {
+            self.bootstrap()?;
+        }
+
         let version = self.store.hub_version()?;
         let url = format!("{}/sync/subscribe?since={}", self.hub_url, version);
 

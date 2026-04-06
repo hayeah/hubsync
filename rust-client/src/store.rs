@@ -6,6 +6,7 @@ use crate::error::Result;
 /// Content storage is handled separately by ContentStore implementations.
 pub struct Store {
     db: Connection,
+    path: String,
 }
 
 impl Store {
@@ -13,9 +14,14 @@ impl Store {
     pub fn open(path: &str) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        let store = Store { db };
+        let store = Store { db, path: path.to_string() };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Get the database file path.
+    pub fn db_path(&self) -> &str {
+        &self.path
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -149,6 +155,28 @@ impl Store {
             params![now, glob],
         )?;
         Ok(count as u64)
+    }
+
+    /// Import hub_tree and sync_state from a downloaded snapshot DB.
+    /// Replaces all existing hub_tree entries and updates hub_version.
+    pub fn import_tree_db(&self, snapshot_path: &str) -> Result<()> {
+        self.db.execute(
+            "ATTACH DATABASE ?1 AS snapshot",
+            params![snapshot_path],
+        )?;
+        let result = (|| -> Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute_batch(
+                "DELETE FROM hub_tree;
+                 INSERT INTO hub_tree SELECT * FROM snapshot.hub_tree;
+                 INSERT OR REPLACE INTO sync_state
+                     SELECT key, value FROM snapshot.sync_state;",
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        self.db.execute_batch("DETACH DATABASE snapshot")?;
+        result
     }
 
     /// Unpin all files matching a glob pattern.
