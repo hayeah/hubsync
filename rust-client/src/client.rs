@@ -140,6 +140,21 @@ impl HubSyncClient {
         // Bootstrap on first sync instead of replaying from version 0
         if version == 0 {
             self.bootstrap()?;
+            // Notify caller that tree data is available via a FileChange event
+            let ver = self.store.hub_version()?;
+            let event = crate::proto::SyncEvent {
+                version: ver as u64,
+                path: String::new(),
+                event: Some(sync_event::Event::Change(crate::proto::FileChange {
+                    kind: 0,
+                    digest: Vec::new(),
+                    size: 0,
+                    mode: 0,
+                    mtime: 0,
+                    data: Vec::new(),
+                })),
+            };
+            on_event(&event);
         }
 
         let version = self.store.hub_version()?;
