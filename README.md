@@ -79,6 +79,8 @@ All endpoints require `Authorization: Bearer <token>` when `HUBSYNC_TOKEN` is se
 | POST | `/blobs/delta` | Delta transfer (rsync-style) |
 | GET | `/snapshots/latest` | Redirect to latest snapshot |
 | GET | `/snapshots/{version}` | Download zstd-compressed tarball snapshot |
+| GET | `/snapshots-tree/latest` | Redirect to latest tree-only snapshot |
+| GET | `/snapshots-tree/{version}` | Download just the hub_tree SQLite DB (no file blobs) |
 | POST | `/push` | Push local changes (write mode) |
 
 ### Sync Stream
@@ -122,6 +124,10 @@ Block size heuristic: `sqrt(24 * fileSize)`, clamped to [1KB, 64KB].
 ### Bootstrap
 
 New clients (or far-behind clients) download a snapshot tarball from `/snapshots/latest`. The tarball contains all files plus `.hubsync/hub_tree.db` with the materialized state. After extraction, the client resumes incremental sync from the snapshot version.
+
+### Tree-Only Snapshot
+
+`/snapshots-tree/{version}` serves just the `hub_tree` SQLite DB without file blobs. Useful for clients that only need metadata (e.g. the Rust client which is SQLite-only, no FS writes). Much smaller than a full snapshot — just the tree state and version cursor.
 
 ## Database Schema
 

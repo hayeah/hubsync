@@ -3,6 +3,8 @@ package hubsync
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -66,6 +68,16 @@ func newTestEnv(t *testing.T) *testEnv {
 			hubCleanup()
 		},
 	}
+}
+
+// authedGet makes a GET request with the test token.
+func (e *testEnv) authedGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	return http.DefaultClient.Do(req)
 }
 
 // writeHubFile writes a file to the hub directory.
@@ -337,6 +349,68 @@ func TestE2ESnapshot(t *testing.T) {
 	}
 	if v != 5 {
 		t.Errorf("hub version after bootstrap: got %d, want 5", v)
+	}
+}
+
+func TestE2ESnapshotTree(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.cleanup()
+
+	// Populate hub with files
+	for i := 0; i < 5; i++ {
+		env.writeHubFile(t, fmt.Sprintf("file%d.txt", i), fmt.Sprintf("content%d", i))
+	}
+	env.scan(t)
+
+	// Fetch just the tree DB (no file blobs)
+	resp, err := env.authedGet(env.ts.URL + "/snapshots-tree/latest")
+	if err != nil {
+		t.Fatalf("fetch snapshot-tree: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("snapshot-tree status: %d", resp.StatusCode)
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-sqlite3" {
+		t.Errorf("content-type: got %q, want application/x-sqlite3", ct)
+	}
+
+	// Write DB to temp file and open it
+	dbPath := filepath.Join(t.TempDir(), "tree.db")
+	body, _ := io.ReadAll(resp.Body)
+	if err := os.WriteFile(dbPath, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("open tree db: %v", err)
+	}
+	defer db.Close()
+
+	store, err := NewClientStore(db)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+
+	// Verify hub_tree has all 5 entries
+	tree, err := store.TreeSnapshot()
+	if err != nil {
+		t.Fatalf("tree snapshot: %v", err)
+	}
+	if len(tree) != 5 {
+		t.Errorf("expected 5 entries, got %d", len(tree))
+	}
+
+	// Verify version
+	v, err := store.HubVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 5 {
+		t.Errorf("hub version: got %d, want 5", v)
 	}
 }
 

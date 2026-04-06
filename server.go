@@ -34,6 +34,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /snapshots/latest", s.auth(s.handleLatestSnapshot))
 	s.mux.HandleFunc("GET /snapshots/{version}", s.auth(s.handleSnapshot))
 	s.mux.HandleFunc("POST /push", s.auth(s.handlePush))
+	s.mux.HandleFunc("GET /snapshots-tree/latest", s.auth(s.handleLatestSnapshotTree))
+	s.mux.HandleFunc("GET /snapshots-tree/{version}", s.auth(s.handleSnapshotTree))
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -198,6 +200,36 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		log.Printf("snapshot generation error: %v", err)
 		// Headers already sent, can't return error to client
 	}
+}
+
+// handleLatestSnapshotTree redirects to the latest snapshot-tree version.
+func (s *Server) handleLatestSnapshotTree(w http.ResponseWriter, r *http.Request) {
+	version, err := s.Hub.Store.LatestVersion()
+	if err != nil || version == 0 {
+		http.Error(w, "no snapshots available", http.StatusNotFound)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/snapshots-tree/%d", version), http.StatusFound)
+}
+
+// handleSnapshotTree serves just the hub_tree SQLite DB (no file blobs).
+func (s *Server) handleSnapshotTree(w http.ResponseWriter, r *http.Request) {
+	versionStr := r.PathValue("version")
+	version, err := strconv.ParseInt(versionStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid version", http.StatusBadRequest)
+		return
+	}
+
+	dbData, err := generateClientDB(s.Hub.Store, version)
+	if err != nil {
+		http.Error(w, "generate db", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-sqlite3")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=hub_tree_%d.db", version))
+	w.Write(dbData)
 }
 
 // handlePush processes a PushRequest and returns a PushResponse.
