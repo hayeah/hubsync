@@ -4,6 +4,7 @@ import CHubSync
 /// Swift wrapper around the Rust hubsync client FFI.
 public final class RustHubSyncClient: @unchecked Sendable {
     private let handle: OpaquePointer
+    private var callbackRef: Unmanaged<CallbackBox>?
 
     /// Open a hubsync client.
     /// - Parameters:
@@ -28,6 +29,7 @@ public final class RustHubSyncClient: @unchecked Sendable {
     }
 
     deinit {
+        stopSync()
         hubsync_free(handle)
     }
 
@@ -40,11 +42,15 @@ public final class RustHubSyncClient: @unchecked Sendable {
 
     /// Start sync with a callback fired on the main queue after each event.
     public func startSync(onEvent: @escaping () -> Void) {
-        // Store callback in a box so we can pass it through C void*
+        // Release previous callback if any
+        releaseCallback()
+
         let box = CallbackBox {
             DispatchQueue.main.async { onEvent() }
         }
-        let ctx = Unmanaged.passRetained(box).toOpaque()
+        let ref = Unmanaged.passRetained(box)
+        callbackRef = ref
+        let ctx = ref.toOpaque()
         hubsync_start_sync_with_callback(handle, { ctx in
             guard let ctx else { return }
             Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue().callback()
@@ -54,6 +60,12 @@ public final class RustHubSyncClient: @unchecked Sendable {
     /// Stop the background sync thread.
     public func stopSync() {
         hubsync_stop_sync(handle)
+        releaseCallback()
+    }
+
+    private func releaseCallback() {
+        callbackRef?.release()
+        callbackRef = nil
     }
 
     // MARK: - Content

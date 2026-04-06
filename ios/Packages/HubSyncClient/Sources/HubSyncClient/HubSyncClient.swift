@@ -5,7 +5,10 @@ public final class HubSyncClient: Sendable {
     public let dbPool: DatabasePool
 
     public init(dbPath: String) throws {
-        dbPool = try DatabasePool(path: dbPath)
+        var config = Configuration()
+        config.busyMode = .timeout(5) // 5 second busy timeout for WAL contention with Rust client
+        config.readonly = false
+        dbPool = try DatabasePool(path: dbPath, configuration: config)
         try dbPool.write { db in
             try createSchema(in: db)
         }
@@ -159,7 +162,7 @@ public final class HubSyncClient: Sendable {
             let sampleContent = "# Hello from HubSync\n\nThis is a mock file.".data(using: .utf8)!
             try ContentCacheRow(
                 digest: "abc123", data: sampleContent,
-                size: Int64(sampleContent.count), fetchedAt: now, accessedAt: now
+                size: Int64(sampleContent.count), fetched_at: now, accessed_at: now
             ).insert(db)
 
             try SyncStateRow(key: "hub_version", value: "1").insert(db)

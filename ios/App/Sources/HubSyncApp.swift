@@ -53,13 +53,18 @@ final class AppState {
 
     func reload() {
         guard let grdbClient else { return }
-        do {
-            files = try grdbClient.dbPool.read { db in
-                try HubTreeRow.fetchAll(db, sql: "SELECT * FROM hub_tree ORDER BY kind DESC, path ASC")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let rows = try grdbClient.dbPool.read { db in
+                    try HubTreeRow.fetchAll(db, sql: "SELECT * FROM hub_tree ORDER BY kind DESC, path ASC")
+                }
+                DispatchQueue.main.async {
+                    self?.files = rows
+                    self?.fileCount = rows.count
+                }
+            } catch {
+                print("Failed to load files: \(error)")
             }
-            fileCount = files.count
-        } catch {
-            print("Failed to load files: \(error)")
         }
     }
 
@@ -125,7 +130,9 @@ struct HubSyncApp: App {
         WindowGroup {
             FileListView()
                 .environment(sharedAppState)
+                #if DEBUG
                 .tapInspectable()
+                #endif
                 .onAppear {
                     sharedAppState.setup()
                     #if DEBUG

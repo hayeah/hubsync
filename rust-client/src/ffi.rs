@@ -4,17 +4,57 @@
 //! The caller must free returned strings/buffers with the corresponding free function.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client::HubSyncClient;
 
+/// Wrapper that lets us send a pointer to HubSyncClient across threads.
+///
+/// SAFETY: The pointee is pinned in HubSyncHandle (Pin<Box<HubSyncClient>>),
+/// and the sync thread is always joined before the client is dropped.
+/// The caller (hubsync_free) enforces join-before-drop.
+struct SendPtr {
+    ptr: usize,
+}
+unsafe impl Send for SendPtr {}
+
+impl SendPtr {
+    fn new(client: &HubSyncClient) -> Self {
+        SendPtr { ptr: client as *const HubSyncClient as usize }
+    }
+
+    /// SAFETY: caller must ensure the pointee is still alive.
+    unsafe fn get(&self) -> &HubSyncClient {
+        &*(self.ptr as *const HubSyncClient)
+    }
+}
+
 /// Opaque handle to a HubSyncClient.
 pub struct HubSyncHandle {
-    client: HubSyncClient,
+    /// Pinned so the pointer to client remains stable while sync thread runs.
+    client: Pin<Box<HubSyncClient>>,
     cancel: Arc<AtomicBool>,
     sync_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HubSyncHandle {
+    /// Stop sync thread and wait for it to finish. Safe to call multiple times.
+    fn stop_sync(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.sync_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for HubSyncHandle {
+    fn drop(&mut self) {
+        // Always join the sync thread before dropping the client.
+        self.stop_sync();
+    }
 }
 
 // -- Lifecycle --
@@ -39,7 +79,7 @@ pub extern "C" fn hubsync_open(
 
     match HubSyncClient::open_sqlite(db_path, hub_url, token) {
         Ok(client) => Box::into_raw(Box::new(HubSyncHandle {
-            client,
+            client: Box::pin(client),
             cancel: Arc::new(AtomicBool::new(false)),
             sync_thread: None,
         })),
@@ -56,12 +96,8 @@ pub extern "C" fn hubsync_free(handle: *mut HubSyncHandle) {
     if handle.is_null() {
         return;
     }
-    let mut handle = unsafe { Box::from_raw(handle) };
-    // Stop sync thread if running
-    handle.cancel.store(true, Ordering::Relaxed);
-    if let Some(thread) = handle.sync_thread.take() {
-        let _ = thread.join();
-    }
+    // Drop calls stop_sync() which joins the thread before freeing client.
+    let _ = unsafe { Box::from_raw(handle) };
 }
 
 // -- Sync --
@@ -81,16 +117,11 @@ pub extern "C" fn hubsync_start_sync(handle: *mut HubSyncHandle) -> c_int {
 
     handle.cancel.store(false, Ordering::Relaxed);
     let cancel = handle.cancel.clone();
-
-    // We need a raw pointer to call sync on the client from another thread.
-    // This is safe because:
-    // 1. The client uses blocking reqwest (thread-safe)
-    // 2. rusqlite Connection is not Sync, but Store wraps it safely
-    // 3. We join the thread before dropping the handle
-    let client_ptr = &handle.client as *const HubSyncClient as usize;
+    let ptr = SendPtr::new(&handle.client);
 
     let thread = std::thread::spawn(move || {
-        let client = unsafe { &*(client_ptr as *const HubSyncClient) };
+        // SAFETY: handle.client is Pin<Box<>>, won't move. Thread is joined before drop.
+        let client = unsafe { ptr.get() };
         if let Err(e) = client.sync(cancel) {
             eprintln!("hubsync sync: {}", e);
         }
@@ -107,11 +138,7 @@ pub extern "C" fn hubsync_stop_sync(handle: *mut HubSyncHandle) {
         Some(h) => h,
         None => return,
     };
-
-    handle.cancel.store(true, Ordering::Relaxed);
-    if let Some(thread) = handle.sync_thread.take() {
-        let _ = thread.join();
-    }
+    handle.stop_sync();
 }
 
 // -- Content --
@@ -317,13 +344,12 @@ pub extern "C" fn hubsync_start_sync_with_callback(
 
     handle.cancel.store(false, Ordering::Relaxed);
     let cancel = handle.cancel.clone();
-    let client_ptr = &handle.client as *const HubSyncClient as usize;
-
-    // Wrap ctx in a Send-able wrapper
+    let ptr = SendPtr::new(&handle.client);
     let ctx_ptr = ctx as usize;
 
     let thread = std::thread::spawn(move || {
-        let client = unsafe { &*(client_ptr as *const HubSyncClient) };
+        // SAFETY: handle.client is Pin<Box<>>, won't move. Thread is joined before drop.
+        let client = unsafe { ptr.get() };
         let _ = client.sync_with_callback(cancel, |_event| {
             callback(ctx_ptr as *mut c_void);
         });

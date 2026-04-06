@@ -115,7 +115,7 @@ public final class HubSyncStream {
                 if !change.data.isEmpty {
                     let now = Int64(Date().timeIntervalSince1970)
                     try db.execute(sql: """
-                        INSERT OR REPLACE INTO content_cache (digest, data, size, fetchedAt, accessedAt)
+                        INSERT OR REPLACE INTO content_cache (digest, data, size, fetched_at, accessed_at)
                         VALUES (?, ?, ?, ?, ?)
                         """, arguments: [
                             digestHex,

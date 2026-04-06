@@ -19,8 +19,8 @@ public struct ContentCacheRow: Codable, FetchableRecord, PersistableRecord {
     public var digest: String
     public var data: Data
     public var size: Int64
-    public var fetchedAt: Int64
-    public var accessedAt: Int64
+    public var fetched_at: Int64
+    public var accessed_at: Int64
 }
 
 public struct HubTreeDeletionRow: Codable, FetchableRecord, PersistableRecord {
@@ -54,8 +54,8 @@ public func createSchema(in db: GRDB.Database) throws {
         t.primaryKey("digest", .text)
         t.column("data", .blob).notNull()
         t.column("size", .integer).notNull()
-        t.column("fetchedAt", .integer).notNull()
-        t.column("accessedAt", .integer).notNull()
+        t.column("fetched_at", .integer).notNull()
+        t.column("accessed_at", .integer).notNull()
     }
 
     try db.create(table: "hub_tree_deletions", ifNotExists: true) { t in

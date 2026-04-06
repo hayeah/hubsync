@@ -3,17 +3,26 @@ import HubSyncClient
 
 final class HubSyncFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     let domain: NSFileProviderDomain
-    let client: HubSyncClient
+    let client: HubSyncClient?
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
 
         // Store DB in shared app group container
-        let containerURL = FileManager.default.containerURL(
+        if let containerURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: "group.com.hubsync.app"
-        )!
-        let dbPath = containerURL.appendingPathComponent("hubsync.db").path
-        self.client = try! HubSyncClient(dbPath: dbPath)
+        ) {
+            let dbPath = containerURL.appendingPathComponent("hubsync.db").path
+            do {
+                self.client = try HubSyncClient(dbPath: dbPath)
+            } catch {
+                NSLog("[HubSync] Failed to open database: \(error)")
+                self.client = nil
+            }
+        } else {
+            NSLog("[HubSync] App group container unavailable")
+            self.client = nil
+        }
 
         super.init()
     }
@@ -26,7 +35,10 @@ final class HubSyncFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         for containerItemIdentifier: NSFileProviderItemIdentifier,
         request: NSFileProviderRequest
     ) throws -> any NSFileProviderEnumerator {
-        HubSyncEnumerator(client: client, containerItemIdentifier: containerItemIdentifier)
+        guard let client else {
+            throw NSFileProviderError(.serverUnreachable)
+        }
+        return HubSyncEnumerator(client: client, containerItemIdentifier: containerItemIdentifier)
     }
 
     // MARK: - Item lookup
@@ -38,6 +50,10 @@ final class HubSyncFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
         do {
+            guard let client else {
+                completionHandler(nil, NSFileProviderError(.serverUnreachable))
+                return progress
+            }
             let path = identifier.rawValue
             guard let row = try client.treeEntry(for: path) else {
                 completionHandler(nil, NSFileProviderError(.noSuchItem))
@@ -64,6 +80,10 @@ final class HubSyncFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         let path = itemIdentifier.rawValue
 
         do {
+            guard let client else {
+                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+                return progress
+            }
             guard let row = try client.treeEntry(for: path) else {
                 completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
                 return progress
