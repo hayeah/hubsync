@@ -30,7 +30,6 @@ final class AppState {
 
     /// Rust FFI client for sync + content fetch
     private var rustClient: RustHubSyncClient?
-    private var pollTimer: Timer?
 
     private var dbPath: String?
 
@@ -70,27 +69,17 @@ final class AppState {
 
         // Stop existing sync
         rustClient?.stopSync()
-        pollTimer?.invalidate()
 
         guard let client = RustHubSyncClient(dbPath: dbPath, hubURL: url) else {
             return "failed to open rust client"
         }
 
-        client.startSync()
+        client.startSync(onEvent: { [weak self] in
+            self?.reload()
+        })
+
         rustClient = client
         syncStatus = "syncing"
-
-        // Poll for version changes every second
-        var lastVersion: Int64 = -1
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, let rustClient = self.rustClient else { return }
-            let version = rustClient.hubVersion
-            if version != lastVersion {
-                lastVersion = version
-                self.reload()
-            }
-        }
-
         return "connected to \(url) (rust)"
     }
 

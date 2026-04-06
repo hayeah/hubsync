@@ -38,14 +38,16 @@ public final class RustHubSyncClient: @unchecked Sendable {
         hubsync_start_sync(handle)
     }
 
-    /// Start sync with a callback fired after events.
+    /// Start sync with a callback fired on the main queue after each event.
     public func startSync(onEvent: @escaping () -> Void) {
         // Store callback in a box so we can pass it through C void*
-        let ctx = Unmanaged.passRetained(CallbackBox(onEvent)).toOpaque()
+        let box = CallbackBox {
+            DispatchQueue.main.async { onEvent() }
+        }
+        let ctx = Unmanaged.passRetained(box).toOpaque()
         hubsync_start_sync_with_callback(handle, { ctx in
             guard let ctx else { return }
-            let box = Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue()
-            box.callback()
+            Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue().callback()
         }, ctx)
     }
 
