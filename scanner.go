@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/hayeah/go-lstree"
 )
@@ -131,6 +132,26 @@ func (s *Scanner) Diff(scanned map[string]FileInfo, currentTree map[string]TreeE
 }
 
 // ProvideIgnorer creates an lstree.Ignorer for the watch directory.
+// Always excludes .hubsync/ (the hub's internal data directory).
 func ProvideIgnorer(dir string) (lstree.Ignorer, error) {
-	return lstree.NewIgnorer(dir)
+	base, err := lstree.NewIgnorer(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &hubsyncIgnorer{base: base}, nil
+}
+
+// hubsyncIgnorer wraps an Ignorer to always exclude .hubsync/.
+type hubsyncIgnorer struct {
+	base lstree.Ignorer
+}
+
+func (h *hubsyncIgnorer) IsIgnored(relPath string, isDir bool) bool {
+	if relPath == ".hubsync" || strings.HasPrefix(relPath, ".hubsync/") {
+		return true
+	}
+	if h.base != nil {
+		return h.base.IsIgnored(relPath, isDir)
+	}
+	return false
 }
