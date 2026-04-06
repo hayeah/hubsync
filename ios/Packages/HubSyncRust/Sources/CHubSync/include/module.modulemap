@@ -1,0 +1,4 @@
+module CHubSync {
+    header "hubsync.h"
+    export *
+}

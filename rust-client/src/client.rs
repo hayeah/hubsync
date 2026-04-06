@@ -63,11 +63,20 @@ impl HubSyncClient {
     /// Sync tree metadata from the hub. Blocks until cancelled or connection drops.
     /// Reconnects automatically on failure.
     pub fn sync(&self, cancel: Arc<AtomicBool>) -> Result<()> {
+        self.sync_with_callback(cancel, |_| {})
+    }
+
+    /// Sync with a callback fired after each event is applied.
+    pub fn sync_with_callback(
+        &self,
+        cancel: Arc<AtomicBool>,
+        mut on_event: impl FnMut(&crate::proto::SyncEvent),
+    ) -> Result<()> {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            match self.sync_once(&cancel) {
+            match self.sync_once_cb(&cancel, &mut on_event) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if cancel.load(Ordering::Relaxed) {
@@ -81,6 +90,14 @@ impl HubSyncClient {
     }
 
     fn sync_once(&self, cancel: &Arc<AtomicBool>) -> Result<()> {
+        self.sync_once_cb(cancel, &mut |_| {})
+    }
+
+    fn sync_once_cb(
+        &self,
+        cancel: &Arc<AtomicBool>,
+        on_event: &mut impl FnMut(&crate::proto::SyncEvent),
+    ) -> Result<()> {
         let version = self.store.hub_version()?;
         let url = format!("{}/sync/subscribe?since={}", self.hub_url, version);
 
@@ -119,6 +136,7 @@ impl HubSyncClient {
             };
 
             self.apply_event(&event)?;
+            on_event(&event);
         }
     }
 

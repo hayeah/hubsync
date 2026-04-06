@@ -9,6 +9,8 @@ options:
 packages:
   HubSyncClient:
     path: Packages/HubSyncClient
+  HubSyncRust:
+    path: Packages/HubSyncRust
   SwiftUITap:
     url: https://github.com/hayeah/SwiftUITap.git
     branch: master
@@ -23,6 +25,7 @@ targets:
       - App/Resources
     dependencies:
       - package: HubSyncClient
+      - package: HubSyncRust
       - package: SwiftUITap
       - target: HubSyncFileProvider
         embed: true

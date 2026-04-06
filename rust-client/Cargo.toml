@@ -3,6 +3,9 @@ name = "hubsync-client"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["lib", "staticlib"]
+
 [dependencies]
 rusqlite = { version = "0.34", features = ["bundled"] }
 prost = "0.13"

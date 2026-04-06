@@ -1,6 +1,6 @@
 import SwiftUI
-import FileProvider
 import HubSyncClient
+import HubSyncRust
 
 #if DEBUG
 import SwiftUITap
@@ -25,8 +25,14 @@ final class AppState {
         """
     }
 
-    private var client: HubSyncClient?
-    private var syncStream: HubSyncStream?
+    /// GRDB client for direct SQL queries (file listing, etc.)
+    private var grdbClient: HubSyncClient?
+
+    /// Rust FFI client for sync + content fetch
+    private var rustClient: RustHubSyncClient?
+    private var pollTimer: Timer?
+
+    private var dbPath: String?
 
     func setup() {
         guard let containerURL = FileManager.default.containerURL(
@@ -36,9 +42,10 @@ final class AppState {
             return
         }
 
-        let dbPath = containerURL.appendingPathComponent("hubsync.db").path
+        let path = containerURL.appendingPathComponent("hubsync.db").path
+        dbPath = path
         do {
-            client = try HubSyncClient(dbPath: dbPath)
+            grdbClient = try HubSyncClient(dbPath: path)
             reload()
         } catch {
             print("DB error: \(error)")
@@ -46,9 +53,9 @@ final class AppState {
     }
 
     func reload() {
-        guard let client else { return }
+        guard let grdbClient else { return }
         do {
-            files = try client.dbPool.read { db in
+            files = try grdbClient.dbPool.read { db in
                 try HubTreeRow.fetchAll(db, sql: "SELECT * FROM hub_tree ORDER BY kind DESC, path ASC")
             }
             fileCount = files.count
@@ -57,29 +64,40 @@ final class AppState {
         }
     }
 
-    /// Connect to a hub server and start syncing.
+    /// Connect to a hub server and start syncing via the Rust client.
     func connectHub(url: String) -> String {
-        guard let client else { return "no client" }
+        guard let dbPath else { return "no db path" }
 
-        // Stop existing stream
-        syncStream?.stop()
+        // Stop existing sync
+        rustClient?.stopSync()
+        pollTimer?.invalidate()
 
-        let stream = HubSyncStream(hubURL: url, dbPool: client.dbPool)
-        stream.onSync = { [weak self] in
-            DispatchQueue.main.async {
-                self?.reload()
+        guard let client = RustHubSyncClient(dbPath: dbPath, hubURL: url) else {
+            return "failed to open rust client"
+        }
+
+        client.startSync()
+        rustClient = client
+        syncStatus = "syncing"
+
+        // Poll for version changes every second
+        var lastVersion: Int64 = -1
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, let rustClient = self.rustClient else { return }
+            let version = rustClient.hubVersion
+            if version != lastVersion {
+                lastVersion = version
+                self.reload()
             }
         }
-        stream.start()
-        syncStream = stream
-        syncStatus = "syncing"
-        return "connected to \(url)"
+
+        return "connected to \(url) (rust)"
     }
 
     func addFile(path: String, size: Int) -> String {
-        guard let client else { return "no client" }
+        guard let grdbClient else { return "no client" }
         do {
-            try client.addFile(path: path, size: Int64(size))
+            try grdbClient.addFile(path: path, size: Int64(size))
             reload()
             return "added \(path), count=\(fileCount)"
         } catch {
@@ -88,9 +106,9 @@ final class AppState {
     }
 
     func removeFile(path: String) -> String {
-        guard let client else { return "no client" }
+        guard let grdbClient else { return "no client" }
         do {
-            let deleted = try client.removeFile(path: path)
+            let deleted = try grdbClient.removeFile(path: path)
             reload()
             return "removed \(path), deleted=\(deleted), count=\(fileCount)"
         } catch {
@@ -99,9 +117,9 @@ final class AppState {
     }
 
     func clearAll() -> String {
-        guard let client else { return "no client" }
+        guard let grdbClient else { return "no client" }
         do {
-            try client.clearAll()
+            try grdbClient.clearAll()
             reload()
             return "cleared, count=\(fileCount)"
         } catch {
