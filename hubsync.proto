@@ -1,0 +1,30 @@
+syntax = "proto3";
+package hubsync;
+option go_package = "github.com/hayeah/hubsync";
+
+message SyncEvent {
+  uint64 version = 1;
+  string path = 2;
+
+  oneof event {
+    FileChange change = 3;
+    FileDelete delete = 4;
+  }
+}
+
+message FileChange {
+  EntryKind kind = 1;
+  bytes digest = 2;
+  uint64 size = 3;
+  uint32 mode = 4;
+  int64 mtime = 5;
+  bytes data = 6; // inline blob for files <= 64KB; empty for large files
+}
+
+message FileDelete {}
+
+enum EntryKind {
+  FILE = 0;
+  DIRECTORY = 1;
+  SYMLINK = 2;
+}
