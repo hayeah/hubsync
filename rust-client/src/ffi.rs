@@ -321,8 +321,13 @@ pub extern "C" fn hubsync_free_string(s: *mut c_char) {
 
 // -- Callback-based sync --
 
-/// Type for the sync callback. Called after each event is applied.
+/// Type for the sync event callback. Called after each event is applied.
 pub type HubSyncCallback = extern "C" fn(ctx: *mut c_void);
+
+/// Type for the bootstrap progress callback.
+/// count=0, total=N means tree import complete (N entries).
+/// count>0 reports blob fetch progress (count of total).
+pub type HubSyncBootstrapCallback = extern "C" fn(count: u64, total: u64, ctx: *mut c_void);
 
 /// Start sync with a callback fired after each event.
 /// The callback runs on the sync thread.
@@ -348,11 +353,50 @@ pub extern "C" fn hubsync_start_sync_with_callback(
     let ctx_ptr = ctx as usize;
 
     let thread = std::thread::spawn(move || {
-        // SAFETY: handle.client is Pin<Box<>>, won't move. Thread is joined before drop.
         let client = unsafe { ptr.get() };
         let _ = client.sync_with_callback(cancel, |_event| {
             callback(ctx_ptr as *mut c_void);
         });
+    });
+
+    handle.sync_thread = Some(thread);
+    0
+}
+
+/// Start sync with separate bootstrap and event callbacks.
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn hubsync_start_sync_with_callbacks(
+    handle: *mut HubSyncHandle,
+    bootstrap_cb: HubSyncBootstrapCallback,
+    event_cb: HubSyncCallback,
+    ctx: *mut c_void,
+) -> c_int {
+    let handle = match unsafe_handle(handle) {
+        Some(h) => h,
+        None => return -1,
+    };
+
+    if handle.sync_thread.is_some() {
+        return -1;
+    }
+
+    handle.cancel.store(false, Ordering::Relaxed);
+    let cancel = handle.cancel.clone();
+    let ptr = SendPtr::new(&handle.client);
+    let ctx_ptr = ctx as usize;
+
+    let thread = std::thread::spawn(move || {
+        let client = unsafe { ptr.get() };
+        let _ = client.sync_with_callbacks(
+            cancel,
+            |progress| {
+                bootstrap_cb(progress.count, progress.total, ctx_ptr as *mut c_void);
+            },
+            |_event| {
+                event_cb(ctx_ptr as *mut c_void);
+            },
+        );
     });
 
     handle.sync_thread = Some(thread);

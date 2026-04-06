@@ -12,6 +12,15 @@ use crate::proto::sync_event;
 use crate::protocol::{read_length_prefixed, sha256_hex};
 use crate::store::Store;
 
+/// Progress report during bootstrap.
+/// (0, total) means tree import complete (total = number of entries).
+/// (count, total) reports blob fetch progress.
+#[derive(Debug, Clone)]
+pub struct BootstrapProgress {
+    pub count: u64,
+    pub total: u64,
+}
+
 /// HubSyncClient syncs tree metadata from a hub and provides on-demand content fetching.
 pub struct HubSyncClient {
     pub store: Store,
@@ -64,20 +73,32 @@ impl HubSyncClient {
     /// Sync tree metadata from the hub. Blocks until cancelled or connection drops.
     /// Reconnects automatically on failure.
     pub fn sync(&self, cancel: Arc<AtomicBool>) -> Result<()> {
-        self.sync_with_callback(cancel, |_| {})
+        self.sync_with_callbacks(cancel, |_| {}, |_| {})
     }
 
     /// Sync with a callback fired after each event is applied.
     pub fn sync_with_callback(
         &self,
         cancel: Arc<AtomicBool>,
+        on_event: impl FnMut(&crate::proto::SyncEvent),
+    ) -> Result<()> {
+        self.sync_with_callbacks(cancel, |_| {}, on_event)
+    }
+
+    /// Sync with separate bootstrap and event callbacks.
+    /// `on_bootstrap` fires during initial bootstrap with progress info.
+    /// `on_event` fires for each incremental sync event.
+    pub fn sync_with_callbacks(
+        &self,
+        cancel: Arc<AtomicBool>,
+        mut on_bootstrap: impl FnMut(&BootstrapProgress),
         mut on_event: impl FnMut(&crate::proto::SyncEvent),
     ) -> Result<()> {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            match self.sync_once_cb(&cancel, &mut on_event) {
+            match self.sync_once_cb(&cancel, &mut on_bootstrap, &mut on_event) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if cancel.load(Ordering::Relaxed) {
@@ -90,14 +111,10 @@ impl HubSyncClient {
         }
     }
 
-    fn sync_once(&self, cancel: &Arc<AtomicBool>) -> Result<()> {
-        self.sync_once_cb(cancel, &mut |_| {})
-    }
-
     /// Bootstrap by fetching the tree DB from /snapshots-tree/latest.
     /// Replaces the local hub_tree and sync_state with the hub's current state.
     /// Only needed on first sync (hub_version == 0).
-    fn bootstrap(&self) -> Result<()> {
+    fn bootstrap(&self, on_progress: &mut impl FnMut(&BootstrapProgress)) -> Result<()> {
         let url = format!("{}/snapshots-tree/latest", self.hub_url);
         let mut req = self.http.get(&url);
         if let Some(ref token) = self.token {
@@ -126,35 +143,26 @@ impl HubSyncClient {
         let _ = std::fs::remove_file(&tmp_path);
 
         let version = self.store.hub_version()?;
-        eprintln!("bootstrap complete, version={}", version);
+        let entry_count = self.store.entry_count()?;
+        eprintln!("bootstrap complete, version={}, entries={}", version, entry_count);
+
+        // Notify: tree import done (count=0 signals tree phase, total=entries imported)
+        on_progress(&BootstrapProgress { count: 0, total: entry_count });
+
         Ok(())
     }
 
     fn sync_once_cb(
         &self,
         cancel: &Arc<AtomicBool>,
+        on_bootstrap: &mut impl FnMut(&BootstrapProgress),
         on_event: &mut impl FnMut(&crate::proto::SyncEvent),
     ) -> Result<()> {
         let version = self.store.hub_version()?;
 
         // Bootstrap on first sync instead of replaying from version 0
         if version == 0 {
-            self.bootstrap()?;
-            // Notify caller that tree data is available via a FileChange event
-            let ver = self.store.hub_version()?;
-            let event = crate::proto::SyncEvent {
-                version: ver as u64,
-                path: String::new(),
-                event: Some(sync_event::Event::Change(crate::proto::FileChange {
-                    kind: 0,
-                    digest: Vec::new(),
-                    size: 0,
-                    mode: 0,
-                    mtime: 0,
-                    data: Vec::new(),
-                })),
-            };
-            on_event(&event);
+            self.bootstrap(on_bootstrap)?;
         }
 
         let version = self.store.hub_version()?;

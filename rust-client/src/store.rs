@@ -157,6 +157,16 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Count entries in hub_tree.
+    pub fn entry_count(&self) -> Result<u64> {
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM hub_tree",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Import hub_tree and sync_state from a downloaded snapshot DB.
     /// Replaces all existing hub_tree entries and updates hub_version.
     pub fn import_tree_db(&self, snapshot_path: &str) -> Result<()> {

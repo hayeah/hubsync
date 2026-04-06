@@ -79,9 +79,14 @@ final class AppState {
             return "failed to open rust client"
         }
 
-        client.startSync(onEvent: { [weak self] in
-            self?.reload()
-        })
+        client.startSync(
+            onBootstrap: { [weak self] count, total in
+                self?.reload()
+            },
+            onEvent: { [weak self] in
+                self?.reload()
+            }
+        )
 
         rustClient = client
         syncStatus = "syncing"

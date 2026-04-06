@@ -9,7 +9,7 @@ pub mod ffi;
 pub mod protocol;
 pub mod store;
 
-pub use client::HubSyncClient;
+pub use client::{BootstrapProgress, HubSyncClient};
 pub use content::{ContentStore, FsContentStore, SqliteContentStore};
 pub use error::Error;
 pub use store::Store;

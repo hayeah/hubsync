@@ -4,7 +4,7 @@ import CHubSync
 /// Swift wrapper around the Rust hubsync client FFI.
 public final class RustHubSyncClient: @unchecked Sendable {
     private let handle: OpaquePointer
-    private var callbackRef: Unmanaged<CallbackBox>?
+    private var callbackRef: Unmanaged<CallbacksBox>?
 
     /// Open a hubsync client.
     /// - Parameters:
@@ -42,19 +42,43 @@ public final class RustHubSyncClient: @unchecked Sendable {
 
     /// Start sync with a callback fired on the main queue after each event.
     public func startSync(onEvent: @escaping () -> Void) {
-        // Release previous callback if any
+        startSync(onBootstrap: { _, _ in }, onEvent: onEvent)
+    }
+
+    /// Start sync with separate bootstrap and event callbacks.
+    /// `onBootstrap(count, total)` — (0, N) means tree import complete with N entries;
+    /// (count, total) reports blob fetch progress.
+    /// `onEvent` fires for each incremental sync event.
+    /// Both callbacks are dispatched to the main queue.
+    public func startSync(
+        onBootstrap: @escaping (UInt64, UInt64) -> Void,
+        onEvent: @escaping () -> Void
+    ) {
         releaseCallback()
 
-        let box = CallbackBox {
-            DispatchQueue.main.async { onEvent() }
-        }
+        let box = CallbacksBox(
+            onBootstrap: { count, total in
+                DispatchQueue.main.async { onBootstrap(count, total) }
+            },
+            onEvent: {
+                DispatchQueue.main.async { onEvent() }
+            }
+        )
         let ref = Unmanaged.passRetained(box)
         callbackRef = ref
         let ctx = ref.toOpaque()
-        hubsync_start_sync_with_callback(handle, { ctx in
-            guard let ctx else { return }
-            Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue().callback()
-        }, ctx)
+        hubsync_start_sync_with_callbacks(
+            handle,
+            { count, total, ctx in
+                guard let ctx else { return }
+                Unmanaged<CallbacksBox>.fromOpaque(ctx).takeUnretainedValue().onBootstrap(count, total)
+            },
+            { ctx in
+                guard let ctx else { return }
+                Unmanaged<CallbacksBox>.fromOpaque(ctx).takeUnretainedValue().onEvent()
+            },
+            ctx
+        )
     }
 
     /// Stop the background sync thread.
@@ -121,9 +145,11 @@ public final class RustHubSyncClient: @unchecked Sendable {
     }
 }
 
-private class CallbackBox {
-    let callback: () -> Void
-    init(_ callback: @escaping () -> Void) {
-        self.callback = callback
+private class CallbacksBox {
+    let onBootstrap: (UInt64, UInt64) -> Void
+    let onEvent: () -> Void
+    init(onBootstrap: @escaping (UInt64, UInt64) -> Void, onEvent: @escaping () -> Void) {
+        self.onBootstrap = onBootstrap
+        self.onEvent = onEvent
     }
 }

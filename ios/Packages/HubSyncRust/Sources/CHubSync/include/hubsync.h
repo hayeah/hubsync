@@ -10,6 +10,11 @@ typedef struct HubSyncHandle HubSyncHandle;
 /// Callback type fired during sync events.
 typedef void (*HubSyncCallback)(void *ctx);
 
+/// Callback type for bootstrap progress.
+/// count=0, total=N means tree import complete (N entries).
+/// count>0 reports blob fetch progress (count of total).
+typedef void (*HubSyncBootstrapCallback)(uint64_t count, uint64_t total, void *ctx);
+
 /// Open a hubsync client with SQLite content backend.
 /// @param db_path Path to SQLite database (created if needed).
 /// @param hub_url Hub server URL (e.g. "http://localhost:8080").
@@ -27,6 +32,13 @@ int hubsync_start_sync(HubSyncHandle *handle);
 /// Start sync with a callback fired after events are applied.
 /// @return 0 on success, -1 on error.
 int hubsync_start_sync_with_callback(HubSyncHandle *handle, HubSyncCallback callback, void *ctx);
+
+/// Start sync with separate bootstrap and event callbacks.
+/// @return 0 on success, -1 on error.
+int hubsync_start_sync_with_callbacks(HubSyncHandle *handle,
+                                       HubSyncBootstrapCallback bootstrap_cb,
+                                       HubSyncCallback event_cb,
+                                       void *ctx);
 
 /// Stop the background sync thread.
 void hubsync_stop_sync(HubSyncHandle *handle);
