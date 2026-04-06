@@ -85,6 +85,13 @@ final class AppState {
 
         rustClient = client
         syncStatus = "syncing"
+
+        // Reload after bootstrap completes (bootstrap imports tree DB
+        // before the sync stream starts, so no event callback fires)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.reload()
+        }
+
         return "connected to \(url) (rust)"
     }
 
