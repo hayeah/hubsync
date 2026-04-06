@@ -288,6 +288,268 @@ func (*FileDelete) Descriptor() ([]byte, []int) {
 	return file_hubsync_proto_rawDescGZIP(), []int{2}
 }
 
+type DeltaRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TargetDigest  []byte                 `protobuf:"bytes,1,opt,name=target_digest,json=targetDigest,proto3" json:"target_digest,omitempty"`
+	BlockSize     uint32                 `protobuf:"varint,2,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
+	Signature     []*BlockSignature      `protobuf:"bytes,3,rep,name=signature,proto3" json:"signature,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeltaRequest) Reset() {
+	*x = DeltaRequest{}
+	mi := &file_hubsync_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeltaRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeltaRequest) ProtoMessage() {}
+
+func (x *DeltaRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hubsync_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeltaRequest.ProtoReflect.Descriptor instead.
+func (*DeltaRequest) Descriptor() ([]byte, []int) {
+	return file_hubsync_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DeltaRequest) GetTargetDigest() []byte {
+	if x != nil {
+		return x.TargetDigest
+	}
+	return nil
+}
+
+func (x *DeltaRequest) GetBlockSize() uint32 {
+	if x != nil {
+		return x.BlockSize
+	}
+	return 0
+}
+
+func (x *DeltaRequest) GetSignature() []*BlockSignature {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+type BlockSignature struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	WeakHash      uint32                 `protobuf:"varint,2,opt,name=weak_hash,json=weakHash,proto3" json:"weak_hash,omitempty"`
+	StrongHash    []byte                 `protobuf:"bytes,3,opt,name=strong_hash,json=strongHash,proto3" json:"strong_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockSignature) Reset() {
+	*x = BlockSignature{}
+	mi := &file_hubsync_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockSignature) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockSignature) ProtoMessage() {}
+
+func (x *BlockSignature) ProtoReflect() protoreflect.Message {
+	mi := &file_hubsync_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockSignature.ProtoReflect.Descriptor instead.
+func (*BlockSignature) Descriptor() ([]byte, []int) {
+	return file_hubsync_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *BlockSignature) GetIndex() uint32 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *BlockSignature) GetWeakHash() uint32 {
+	if x != nil {
+		return x.WeakHash
+	}
+	return 0
+}
+
+func (x *BlockSignature) GetStrongHash() []byte {
+	if x != nil {
+		return x.StrongHash
+	}
+	return nil
+}
+
+type DeltaResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TargetDigest  []byte                 `protobuf:"bytes,1,opt,name=target_digest,json=targetDigest,proto3" json:"target_digest,omitempty"`
+	TargetSize    uint64                 `protobuf:"varint,2,opt,name=target_size,json=targetSize,proto3" json:"target_size,omitempty"`
+	Ops           []*DeltaOp             `protobuf:"bytes,3,rep,name=ops,proto3" json:"ops,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeltaResponse) Reset() {
+	*x = DeltaResponse{}
+	mi := &file_hubsync_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeltaResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeltaResponse) ProtoMessage() {}
+
+func (x *DeltaResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hubsync_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeltaResponse.ProtoReflect.Descriptor instead.
+func (*DeltaResponse) Descriptor() ([]byte, []int) {
+	return file_hubsync_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DeltaResponse) GetTargetDigest() []byte {
+	if x != nil {
+		return x.TargetDigest
+	}
+	return nil
+}
+
+func (x *DeltaResponse) GetTargetSize() uint64 {
+	if x != nil {
+		return x.TargetSize
+	}
+	return 0
+}
+
+func (x *DeltaResponse) GetOps() []*DeltaOp {
+	if x != nil {
+		return x.Ops
+	}
+	return nil
+}
+
+type DeltaOp struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Op:
+	//
+	//	*DeltaOp_CopyIndex
+	//	*DeltaOp_Data
+	Op            isDeltaOp_Op `protobuf_oneof:"op"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeltaOp) Reset() {
+	*x = DeltaOp{}
+	mi := &file_hubsync_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeltaOp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeltaOp) ProtoMessage() {}
+
+func (x *DeltaOp) ProtoReflect() protoreflect.Message {
+	mi := &file_hubsync_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeltaOp.ProtoReflect.Descriptor instead.
+func (*DeltaOp) Descriptor() ([]byte, []int) {
+	return file_hubsync_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *DeltaOp) GetOp() isDeltaOp_Op {
+	if x != nil {
+		return x.Op
+	}
+	return nil
+}
+
+func (x *DeltaOp) GetCopyIndex() uint32 {
+	if x != nil {
+		if x, ok := x.Op.(*DeltaOp_CopyIndex); ok {
+			return x.CopyIndex
+		}
+	}
+	return 0
+}
+
+func (x *DeltaOp) GetData() []byte {
+	if x != nil {
+		if x, ok := x.Op.(*DeltaOp_Data); ok {
+			return x.Data
+		}
+	}
+	return nil
+}
+
+type isDeltaOp_Op interface {
+	isDeltaOp_Op()
+}
+
+type DeltaOp_CopyIndex struct {
+	CopyIndex uint32 `protobuf:"varint,1,opt,name=copy_index,json=copyIndex,proto3,oneof"`
+}
+
+type DeltaOp_Data struct {
+	Data []byte `protobuf:"bytes,2,opt,name=data,proto3,oneof"`
+}
+
+func (*DeltaOp_CopyIndex) isDeltaOp_Op() {}
+
+func (*DeltaOp_Data) isDeltaOp_Op() {}
+
 var File_hubsync_proto protoreflect.FileDescriptor
 
 const file_hubsync_proto_rawDesc = "" +
@@ -308,7 +570,27 @@ const file_hubsync_proto_rawDesc = "" +
 	"\x05mtime\x18\x05 \x01(\x03R\x05mtime\x12\x12\n" +
 	"\x04data\x18\x06 \x01(\fR\x04data\"\f\n" +
 	"\n" +
-	"FileDelete*1\n" +
+	"FileDelete\"\x89\x01\n" +
+	"\fDeltaRequest\x12#\n" +
+	"\rtarget_digest\x18\x01 \x01(\fR\ftargetDigest\x12\x1d\n" +
+	"\n" +
+	"block_size\x18\x02 \x01(\rR\tblockSize\x125\n" +
+	"\tsignature\x18\x03 \x03(\v2\x17.hubsync.BlockSignatureR\tsignature\"d\n" +
+	"\x0eBlockSignature\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\rR\x05index\x12\x1b\n" +
+	"\tweak_hash\x18\x02 \x01(\rR\bweakHash\x12\x1f\n" +
+	"\vstrong_hash\x18\x03 \x01(\fR\n" +
+	"strongHash\"y\n" +
+	"\rDeltaResponse\x12#\n" +
+	"\rtarget_digest\x18\x01 \x01(\fR\ftargetDigest\x12\x1f\n" +
+	"\vtarget_size\x18\x02 \x01(\x04R\n" +
+	"targetSize\x12\"\n" +
+	"\x03ops\x18\x03 \x03(\v2\x10.hubsync.DeltaOpR\x03ops\"F\n" +
+	"\aDeltaOp\x12\x1f\n" +
+	"\n" +
+	"copy_index\x18\x01 \x01(\rH\x00R\tcopyIndex\x12\x14\n" +
+	"\x04data\x18\x02 \x01(\fH\x00R\x04dataB\x04\n" +
+	"\x02op*1\n" +
 	"\tEntryKind\x12\b\n" +
 	"\x04FILE\x10\x00\x12\r\n" +
 	"\tDIRECTORY\x10\x01\x12\v\n" +
@@ -327,22 +609,28 @@ func file_hubsync_proto_rawDescGZIP() []byte {
 }
 
 var file_hubsync_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_hubsync_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_hubsync_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_hubsync_proto_goTypes = []any{
-	(EntryKind)(0),     // 0: hubsync.EntryKind
-	(*SyncEvent)(nil),  // 1: hubsync.SyncEvent
-	(*FileChange)(nil), // 2: hubsync.FileChange
-	(*FileDelete)(nil), // 3: hubsync.FileDelete
+	(EntryKind)(0),         // 0: hubsync.EntryKind
+	(*SyncEvent)(nil),      // 1: hubsync.SyncEvent
+	(*FileChange)(nil),     // 2: hubsync.FileChange
+	(*FileDelete)(nil),     // 3: hubsync.FileDelete
+	(*DeltaRequest)(nil),   // 4: hubsync.DeltaRequest
+	(*BlockSignature)(nil), // 5: hubsync.BlockSignature
+	(*DeltaResponse)(nil),  // 6: hubsync.DeltaResponse
+	(*DeltaOp)(nil),        // 7: hubsync.DeltaOp
 }
 var file_hubsync_proto_depIdxs = []int32{
 	2, // 0: hubsync.SyncEvent.change:type_name -> hubsync.FileChange
 	3, // 1: hubsync.SyncEvent.delete:type_name -> hubsync.FileDelete
 	0, // 2: hubsync.FileChange.kind:type_name -> hubsync.EntryKind
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	5, // 3: hubsync.DeltaRequest.signature:type_name -> hubsync.BlockSignature
+	7, // 4: hubsync.DeltaResponse.ops:type_name -> hubsync.DeltaOp
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_hubsync_proto_init() }
@@ -354,13 +642,17 @@ func file_hubsync_proto_init() {
 		(*SyncEvent_Change)(nil),
 		(*SyncEvent_Delete)(nil),
 	}
+	file_hubsync_proto_msgTypes[6].OneofWrappers = []any{
+		(*DeltaOp_CopyIndex)(nil),
+		(*DeltaOp_Data)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hubsync_proto_rawDesc), len(file_hubsync_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   3,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

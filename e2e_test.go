@@ -339,3 +339,52 @@ func TestE2ESnapshot(t *testing.T) {
 		t.Errorf("hub version after bootstrap: got %d, want 5", v)
 	}
 }
+
+func TestE2EDeltaTransfer(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.cleanup()
+
+	// Create a large file (> InlineThreshold so it won't be inlined)
+	size := InlineThreshold + 4096
+	original := make([]byte, size)
+	for i := range original {
+		original[i] = byte(i % 256)
+	}
+	env.writeHubFile(t, "big.bin", string(original))
+	env.scan(t)
+
+	// Sync to get the original file
+	v1, _ := env.hubApp.Hub.Store.LatestVersion()
+	env.syncUntil(t, v1, 10*time.Second)
+	env.assertClientFile(t, "big.bin", string(original))
+
+	// Modify a small part of the file (triggers delta transfer on next sync)
+	modified := make([]byte, size)
+	copy(modified, original)
+	modified[1000] = 0xFF
+	modified[1001] = 0xFE
+	modified[1002] = 0xFD
+
+	time.Sleep(1100 * time.Millisecond) // mtime granularity
+	env.writeHubFile(t, "big.bin", string(modified))
+	env.scan(t)
+
+	v2, _ := env.hubApp.Hub.Store.LatestVersion()
+	env.syncUntil(t, v2, 10*time.Second)
+
+	// Verify the client has the modified content
+	fullPath := filepath.Join(env.clientDir, "big.bin")
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatalf("read big.bin: %v", err)
+	}
+	if len(data) != len(modified) {
+		t.Fatalf("size mismatch: got %d, want %d", len(data), len(modified))
+	}
+	for i := range data {
+		if data[i] != modified[i] {
+			t.Fatalf("content mismatch at byte %d: got %d, want %d", i, data[i], modified[i])
+			break
+		}
+	}
+}

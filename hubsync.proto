@@ -28,3 +28,30 @@ enum EntryKind {
   DIRECTORY = 1;
   SYMLINK = 2;
 }
+
+// --- Delta transfer ---
+
+message DeltaRequest {
+  bytes target_digest = 1;
+  uint32 block_size = 2;
+  repeated BlockSignature signature = 3;
+}
+
+message BlockSignature {
+  uint32 index = 1;
+  uint32 weak_hash = 2;
+  bytes strong_hash = 3;
+}
+
+message DeltaResponse {
+  bytes target_digest = 1;
+  uint64 target_size = 2;
+  repeated DeltaOp ops = 3;
+}
+
+message DeltaOp {
+  oneof op {
+    uint32 copy_index = 1;
+    bytes data = 2;
+  }
+}

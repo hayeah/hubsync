@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // Server serves the hub's HTTP API.
@@ -28,6 +30,7 @@ func NewServer(hub *Hub, token BearerToken, listen string) *Server {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /sync/subscribe", s.auth(s.handleSubscribe))
 	s.mux.HandleFunc("GET /blobs/{digest}", s.auth(s.handleBlob))
+	s.mux.HandleFunc("POST /blobs/delta", s.auth(s.handleDelta))
 	s.mux.HandleFunc("GET /snapshots/latest", s.auth(s.handleLatestSnapshot))
 	s.mux.HandleFunc("GET /snapshots/{version}", s.auth(s.handleSnapshot))
 }
@@ -194,4 +197,69 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		log.Printf("snapshot generation error: %v", err)
 		// Headers already sent, can't return error to client
 	}
+}
+
+// handleDelta receives a DeltaRequest (block signatures from client's old version)
+// and responds with a DeltaResponse (delta ops to reconstruct the target file).
+func (s *Server) handleDelta(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+
+	var req DeltaRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid protobuf", http.StatusBadRequest)
+		return
+	}
+
+	targetDigest, err := ParseDigest(fmt.Sprintf("%x", req.TargetDigest))
+	if err != nil {
+		http.Error(w, "invalid target digest", http.StatusBadRequest)
+		return
+	}
+
+	// Find the target file on disk
+	targetPath, ok := s.Hub.Store.PathByDigest(targetDigest)
+	if !ok {
+		http.Error(w, "target not found", http.StatusNotFound)
+		return
+	}
+
+	targetData, err := os.ReadFile(filepath.Join(s.Hub.Scanner.dir, targetPath))
+	if err != nil {
+		http.Error(w, "read target file", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert proto signatures to internal format
+	sigs := make([]BlockSig, len(req.Signature))
+	for i, ps := range req.Signature {
+		sigs[i] = BlockSig{
+			Index:    ps.Index,
+			WeakHash: ps.WeakHash,
+		}
+		if len(ps.StrongHash) == 32 {
+			copy(sigs[i].StrongHash[:], ps.StrongHash)
+		}
+	}
+
+	// Compute delta
+	blockSize := int(req.BlockSize)
+	if blockSize <= 0 {
+		blockSize = defaultBlockSize
+	}
+	delta := ComputeDelta(targetData, sigs, blockSize)
+
+	// Send response
+	resp := delta.ToProto(req.TargetDigest)
+	respData, err := proto.Marshal(resp)
+	if err != nil {
+		http.Error(w, "marshal response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(respData)
 }

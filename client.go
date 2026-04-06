@@ -1,6 +1,7 @@
 package hubsync
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // Client is a read-only replica that syncs from a hub.
@@ -171,8 +174,8 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 				return err
 			}
 		} else {
-			// Large file: need to fetch
-			if err := c.fetchAndWriteBlob(digest, fullPath, os.FileMode(change.Mode)); err != nil {
+			// Large file: try delta if we have an old version, else full fetch
+			if err := c.fetchLargeFile(digest, path, fullPath, os.FileMode(change.Mode)); err != nil {
 				return err
 			}
 		}
@@ -213,11 +216,13 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 	return nil
 }
 
-// fetchAndWriteBlob fetches a blob from the hub and writes it to the local path.
-// Tries dedup first: if we already have the digest locally, copy instead.
-func (c *Client) fetchAndWriteBlob(digest Digest, destPath string, mode os.FileMode) error {
-	// Try dedup
-	existingPath, found, err := c.Store.LookupByDigest(digest, "")
+// fetchLargeFile fetches a large file using the best available strategy:
+// 1. Dedup: if the digest already exists locally at another path, copy it
+// 2. Delta: if we have an old version at the same path, use rsync delta
+// 3. Full fetch: download the entire blob
+func (c *Client) fetchLargeFile(digest Digest, relPath, destPath string, mode os.FileMode) error {
+	// Try dedup: same digest at a different path
+	existingPath, found, err := c.Store.LookupByDigest(digest, relPath)
 	if err == nil && found {
 		srcPath := filepath.Join(c.syncDir, existingPath)
 		if data, err := os.ReadFile(srcPath); err == nil {
@@ -225,7 +230,87 @@ func (c *Client) fetchAndWriteBlob(digest Digest, destPath string, mode os.FileM
 		}
 	}
 
-	// Fetch from hub
+	// Try delta: if we have a local file at this path, send its signature
+	if localData, err := os.ReadFile(destPath); err == nil && len(localData) > 0 {
+		data, err := c.fetchDelta(digest, localData)
+		if err == nil {
+			return os.WriteFile(destPath, data, mode)
+		}
+		log.Printf("delta fetch failed for %s, falling back to full: %v", relPath, err)
+	}
+
+	// Full fetch
+	return c.fetchFullBlob(digest, destPath, mode)
+}
+
+// fetchDelta sends block signatures of the local file to the hub and
+// applies the returned delta to reconstruct the target file.
+func (c *Client) fetchDelta(targetDigest Digest, localData []byte) ([]byte, error) {
+	blockSize := OptimalBlockSize(int64(len(localData)))
+	sigs := ComputeSignature(localData, blockSize)
+
+	// Build protobuf request
+	req := &DeltaRequest{
+		TargetDigest: targetDigest[:],
+		BlockSize:    uint32(blockSize),
+	}
+	for _, sig := range sigs {
+		req.Signature = append(req.Signature, &BlockSignature{
+			Index:      sig.Index,
+			WeakHash:   sig.WeakHash,
+			StrongHash: sig.StrongHash[:],
+		})
+	}
+
+	reqData, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal delta request: %w", err)
+	}
+
+	// POST to hub
+	httpReq, err := http.NewRequest("POST", c.hubURL+"/blobs/delta", bytes.NewReader(reqData))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/octet-stream")
+	c.setAuth(httpReq)
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("delta request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("delta response %s: %s", resp.Status, body)
+	}
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var deltaResp DeltaResponse
+	if err := proto.Unmarshal(respData, &deltaResp); err != nil {
+		return nil, fmt.Errorf("unmarshal delta response: %w", err)
+	}
+
+	// Apply delta
+	ops := DeltaOpsFromProto(&deltaResp)
+	result := ApplyDelta(localData, ops, blockSize)
+
+	// Verify digest
+	got := ComputeDigest(result)
+	if got != targetDigest {
+		return nil, fmt.Errorf("delta result digest mismatch: got %s, want %s", got.Hex(), targetDigest.Hex())
+	}
+
+	return result, nil
+}
+
+// fetchFullBlob downloads the entire blob from the hub.
+func (c *Client) fetchFullBlob(digest Digest, destPath string, mode os.FileMode) error {
 	url := fmt.Sprintf("%s/blobs/%s", c.hubURL, digest.Hex())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
