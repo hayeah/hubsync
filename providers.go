@@ -1,6 +1,8 @@
 package hubsync
 
 import (
+	"time"
+
 	"github.com/google/wire"
 )
 
@@ -82,5 +84,13 @@ func ProvideClientStore(cfg *ClientConfig) (*ClientStore, func(), error) {
 
 // ProvideClient creates a Client from ClientConfig.
 func ProvideClient(store *ClientStore, cfg *ClientConfig) *Client {
-	return NewClient(store, cfg.HubURL, BearerToken(cfg.Token), cfg.SyncDir)
+	c := NewClient(store, cfg.HubURL, BearerToken(cfg.Token), cfg.SyncDir)
+	if cfg.Mode == "write" {
+		var interval time.Duration
+		if cfg.ScanInterval != "" {
+			interval, _ = time.ParseDuration(cfg.ScanInterval)
+		}
+		c.SetWriteMode(interval)
+	}
+	return c
 }

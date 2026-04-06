@@ -10,10 +10,12 @@ type HubConfig struct {
 
 // ClientConfig holds all configuration for the client.
 type ClientConfig struct {
-	DBPath  string
-	HubURL  string
-	Token   string
-	SyncDir string
+	DBPath       string
+	HubURL       string
+	Token        string
+	SyncDir      string
+	Mode         string // "read" or "write" (default: "read")
+	ScanInterval string // duration string for write mode scan interval (default: "5s")
 }
 
 // BearerToken returns the token for auth middleware.

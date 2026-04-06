@@ -102,6 +102,75 @@ func (s *ClientStore) LookupByDigest(digest Digest, excludePath string) (string,
 	return path, true, nil
 }
 
+// hubTreeRow represents a row from the hub_tree table.
+type hubTreeRow struct {
+	Path    string         `db:"path"`
+	Kind    int            `db:"kind"`
+	Digest  sql.NullString `db:"digest"`
+	Size    int64          `db:"size"`
+	Mode    uint32         `db:"mode"`
+	MTime   int64          `db:"mtime"`
+	Version int64          `db:"version"`
+}
+
+// HubTreeEntry represents an entry in the client's hub_tree with its version.
+type HubTreeEntry struct {
+	TreeEntry
+	Version int64
+}
+
+// TreeSnapshot returns all entries from hub_tree as a map.
+func (s *ClientStore) TreeSnapshot() (map[string]HubTreeEntry, error) {
+	var rows []hubTreeRow
+	if err := s.DB.Select(&rows, `SELECT path, kind, digest, size, mode, mtime, version FROM hub_tree`); err != nil {
+		return nil, err
+	}
+	result := make(map[string]HubTreeEntry, len(rows))
+	for _, r := range rows {
+		entry := HubTreeEntry{
+			TreeEntry: TreeEntry{
+				Path: r.Path,
+				Kind: FileKind(r.Kind),
+				Size: r.Size,
+				Mode: r.Mode,
+				MTime: r.MTime,
+			},
+			Version: r.Version,
+		}
+		if r.Digest.Valid {
+			entry.Digest, _ = ParseDigest(r.Digest.String)
+		}
+		result[r.Path] = entry
+	}
+	return result, nil
+}
+
+// LookupEntry returns a single hub_tree entry by path.
+func (s *ClientStore) LookupEntry(path string) (HubTreeEntry, bool, error) {
+	var r hubTreeRow
+	err := s.DB.Get(&r, `SELECT path, kind, digest, size, mode, mtime, version FROM hub_tree WHERE path = ?`, path)
+	if err == sql.ErrNoRows {
+		return HubTreeEntry{}, false, nil
+	}
+	if err != nil {
+		return HubTreeEntry{}, false, err
+	}
+	entry := HubTreeEntry{
+		TreeEntry: TreeEntry{
+			Path: r.Path,
+			Kind: FileKind(r.Kind),
+			Size: r.Size,
+			Mode: r.Mode,
+			MTime: r.MTime,
+		},
+		Version: r.Version,
+	}
+	if r.Digest.Valid {
+		entry.Digest, _ = ParseDigest(r.Digest.String)
+	}
+	return entry, true, nil
+}
+
 // ApplyChange applies a single sync event to the client store within a transaction.
 func (s *ClientStore) ApplyChange(version int64, path string, op ChangeOp, kind FileKind, digest Digest, size int64, mode uint32, mtime int64) error {
 	tx, err := s.DB.Beginx()

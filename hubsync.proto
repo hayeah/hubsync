@@ -29,6 +29,55 @@ enum EntryKind {
   SYMLINK = 2;
 }
 
+// --- Push ---
+
+message PushRequest {
+  repeated PushOp ops = 1;
+  ConflictPolicy on_conflict = 2;
+}
+
+message PushOp {
+  string path = 1;
+  OpKind op = 2;
+  uint64 base_version = 3;  // version this edit is based on (from hub_tree.version)
+  bytes digest = 4;          // SHA-256 of new content
+  bytes data = 5;            // blob content (inline)
+}
+
+enum OpKind {
+  OP_CREATE = 0;
+  OP_UPDATE = 1;
+  OP_DELETE = 2;
+}
+
+enum ConflictPolicy {
+  FAIL = 0;           // partial success, conflicts returned
+  HUB_WINS = 1;       // drop conflicting client changes silently
+  CLIENT_WINS = 2;    // force overwrite hub
+}
+
+message PushResponse {
+  repeated PushResult results = 1;
+}
+
+message PushResult {
+  string path = 1;
+  oneof outcome {
+    PushAccepted accepted = 2;
+    PushConflict conflict = 3;
+  }
+}
+
+message PushAccepted {
+  uint64 version = 1;       // new version assigned by hub
+}
+
+message PushConflict {
+  string reason = 1;
+  uint64 current_version = 2;
+  bytes current_digest = 3;
+}
+
 // --- Delta transfer ---
 
 message DeltaRequest {

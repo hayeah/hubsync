@@ -1,5 +1,5 @@
 ---
-overview: Spec for hubsync client read/write permissions. Two permission levels (read, write). Adds push endpoint, auto-merge, conflict resolution, and client-side scanning to the existing read-only implementation.
+overview: Spec for hubsync client read/write permissions. Adds push endpoint, optimistic concurrency, conflicted copy resolution, and client-side scanning to the existing read-only implementation.
 repo: ~/github.com/hayeah/hubsync
 tags:
   - spec
@@ -8,11 +8,17 @@ tags:
 
 # HubSync: Client Read/Write Spec
 
-Extends the read-only sync system (see `docs/spec.md`) with write support. Two permission levels: **read** and **write**.
+Extends the read-only sync system (see `docs/spec.md`) with write support.
+
+## Design Principles
+
+- **Files are opaque blobs** — no content-level merging (no 3-way text merge, no diff-patch). Same approach as Dropbox and mutagen.
+- **Optimistic concurrency** — pushes carry a `base_version`; the hub rejects stale writes.
+- **Conflicted copy** — on conflict, the client's local version is renamed to `(conflicted copy)` and the hub's version is fetched. Agents or users reconcile manually per file.
 
 ## Authentication
 
-All endpoints require a valid bearer token (`HUBSYNC_TOKEN`). A valid token grants full read/write access — no per-client permission levels.
+All endpoints require a valid bearer token (`HUBSYNC_TOKEN`). A valid token grants full read/write access.
 
 ## Protocol Additions
 
@@ -37,15 +43,15 @@ message PushOp {
 }
 
 enum OpKind {
-  CREATE = 0;
-  UPDATE = 1;
-  DELETE = 2;
+  OP_CREATE = 0;
+  OP_UPDATE = 1;
+  OP_DELETE = 2;
 }
 
 enum ConflictPolicy {
   FAIL = 0;           // partial success, conflicts returned
   HUB_WINS = 1;       // drop conflicting client changes silently
-  CLIENT_WINS = 2;    // force overwrite hub (requires write permission)
+  CLIENT_WINS = 2;    // force overwrite hub
 }
 
 message PushResponse {
@@ -62,8 +68,6 @@ message PushResult {
 
 message PushAccepted {
   uint64 version = 1;       // new version assigned by hub
-  bool merged = 2;           // true = hub auto-merged, client should pull result
-  string merge_strategy = 3; // e.g. "text", "json", "append"
 }
 
 message PushConflict {
@@ -83,50 +87,45 @@ Blob content is inline in `PushOp.data`.
 
 Each `PushOp` carries a `base_version` — the version of the file the client last saw (from its `hub_tree.version` column). The hub uses this for optimistic concurrency:
 
-- **base_version matches current** — accept directly
-- **base_version is stale** — attempt auto-merge
-- **auto-merge fails** — return conflict
+- **base_version matches current** — accept, write to disk, append to change_log, broadcast
+- **base_version is stale** — conflict (no auto-merge)
 
 The `on_conflict` field controls fallback:
 
-- **`FAIL`** (default) — partial success, conflicts returned for resolution
-- **`HUB_WINS`** — silently drop conflicting ops (reported in response). Good for fire-and-forget agents
-- **`CLIENT_WINS`** — force overwrite. For trusted editors
+- **`FAIL`** (default) — return conflict with `current_version` and `current_digest` so the client can pull and retry
+- **`HUB_WINS`** — silently drop conflicting ops. Good for fire-and-forget agents
+- **`CLIENT_WINS`** — force overwrite regardless of version. For trusted editors
 
-## Hub-Side Auto-Merge
+No blob retention or merge tables needed — the hub only needs the current file on disk and the current version in the change log.
 
-When a push arrives with a stale base version, the hub has all three versions:
+## Conflict Resolution: Conflicted Copy
 
-```
-base   = blob at the client's base_version (from change_log / blob store)
-theirs = blob at current hub version
-ours   = blob from client push
-```
+When a push returns a conflict (under `FAIL` policy), the client:
 
-The hub runs a text three-way merge (diff3) on the three versions. If no overlapping hunks, produce the merged result. Same algorithm as `git merge`. If there are overlapping hunks, return a conflict.
+- Renames the local file to `<name> (conflicted copy).<ext>`
+- Fetches the hub's current blob via `GET /blobs/{digest}` and writes it to the original path
+- Logs the conflict for the caller
 
-### Blob Retention for Merge
+If a conflicted copy already exists, appends a number: `<name> (conflicted copy 2).<ext>`.
 
-Auto-merge requires keeping historical blobs. Since the hub serves blobs from the watched directory (no blob table), it needs to retain old versions for merge:
+This is easy for agents to handle per-file — they can read both versions, decide which to keep, and push again. No special API needed.
 
-- Keep a `merge_blobs` table for recently-overwritten content
-- Retention window: configurable (e.g. last 1000 versions or 24 hours)
-- Client whose `base_version` is older than the retention window gets a conflict with reason `"base_too_old"` — client must pull and retry
+### Resolution Strategies (caller's choice)
 
-```sql
-CREATE TABLE merge_blobs (
-  version   INTEGER PRIMARY KEY,
-  path      TEXT NOT NULL,
-  digest    TEXT NOT NULL,
-  data      BLOB NOT NULL
-);
-```
+| Strategy | Behavior | Good for |
+|---|---|---|
+| **hub-wins** | Push with `on_conflict=HUB_WINS`, local change dropped | Agents that can regenerate |
+| **client-wins** | Re-push with `on_conflict=CLIENT_WINS` | Trusted editors |
+| **fork** | Keep the conflicted copy, let user decide | Human review later |
+| **retry** | Read hub version, redo work, push again | Agents with deterministic output |
+
+The resolution strategy is chosen by the caller (app or agent), not configured in the client library.
 
 ## Write Client Design
 
 ### Client-Side Local Tree Scanning
 
-A write client needs to detect local changes. It compares local filesystem state against the `hub_tree` to produce a diff.
+A write client detects local changes by comparing local filesystem state against the `hub_tree`.
 
 ```
 scan(sync_dir, hub_tree):
@@ -177,26 +176,25 @@ Client                              Hub
   |          d.txt=CREATE]            |
   |   on_conflict: FAIL               |
   |                                   |
-  |             [b.txt: stale → try merge]
-  |             [  text 3-way → success]
+  |             [b.txt: stale → conflict]
   |             [c.txt: version matches → accept]
   |             [d.txt: new → accept]
   |                                   |
   | <---- PushResponse ------------- |
-  |   results: [b=accepted(merged),  |
+  |   results: [b=conflict,          |
   |             c=accepted,           |
   |             d=accepted]           |
   |                                   |
   [update hub_tree for c, d]         |
-  [b was merged: pull merged blob    |
-   via sync stream]                   |
+  [b conflicted: rename local to     |
+   "b (conflicted copy).txt",        |
+   fetch hub's version]              |
 ```
 
 After push:
 
-- **Accepted (not merged)**: update `hub_tree` entry with new version and digest
-- **Accepted (merged)**: the hub's merged result differs from what we sent. The client will receive the merged version via the sync stream — update hub_tree and local file then
-- **Conflict**: surface to caller for resolution
+- **Accepted**: update `hub_tree` entry with new version and digest
+- **Conflict**: rename local to conflicted copy, fetch hub's current blob
 
 ### Reconnect with Local Edits
 
@@ -208,59 +206,39 @@ Client comes online:
     (DO NOT overwrite local files for paths with local edits)
   - Scan local FS, diff against updated hub_tree
   - POST /push with diff
-  - Handle conflicts
+  - Handle conflicts (conflicted copy)
 ```
 
 Local edits survive reconnect — they're on the filesystem. The hub tree updates independently. The diff catches everything.
-
-### Conflict Resolution Strategies
-
-When auto-merge fails and `on_conflict=FAIL`, the client gets a conflict list. Resolution options:
-
-| Strategy | Behavior | Good for |
-|---|---|---|
-| **hub-wins** | Discard local, accept hub version | Agents that can regenerate |
-| **client-wins** | Re-push with `on_conflict=CLIENT_WINS` | Trusted editors |
-| **fork** | Save local as `.conflict` file, pull hub version | Human review later |
-| **retry** | Pull latest, re-do local work, push again | Agents with deterministic output |
-
-The resolution strategy is chosen by the caller (app or agent), not configured in the client library.
 
 ## Go Client Additions
 
 The existing Go CLI client (`hubsync client`) gains write support:
 
 - `-mode read|write` flag (default: `read`)
-- In write mode: periodic local scan + push loop
-- Scan interval configurable (default: 5s)
+- `-scan-interval` duration (default: `5s`)
+- In write mode: periodic local scan + push loop alongside sync stream
 - Uses `.gitignore` filtering (same as hub) when scanning
 
 ### Write Mode Loop
 
 ```
 loop:
-  - Wait for scan trigger (timer or FS watcher event)
+  - Wait for scan trigger (timer)
   - Scan local FS, diff against hub_tree
   - If changes found: POST /push
   - Handle response:
     - accepted: update hub_tree
-    - merged: wait for sync stream to deliver merged version
-    - conflict: log warning, skip (hub-wins by default for CLI)
+    - conflict: create conflicted copy, fetch hub version
 ```
 
-### Client-Side FS Watcher (Optional)
+### Client-Side FS Watcher (Optional, not yet implemented)
 
-For responsive push in write mode, the client can use `fsnotify` to detect local changes immediately rather than waiting for the scan timer. Same debounce logic as the hub (50ms). Falls back to timer-based scanning if watcher errors.
+For responsive push in write mode, the client could use `fsnotify` to detect local changes immediately rather than waiting for the scan timer. Same debounce logic as the hub (50ms). Falls back to timer-based scanning if watcher errors.
 
 ## Rust Client Additions
 
-The Rust client (see `docs/rust-client-spec.md`) is currently read-only + SQLite-only (no FS writes). Write support for the Rust client is a separate concern — it would require:
-
-- Local filesystem materialization (writing synced files to disk)
-- Local scanning + diffing
-- Push API
-
-This is deferred. The Rust client remains read-only for now.
+The Rust client (see `docs/rust-client-spec.md`) is currently read-only + SQLite-only (no FS writes). Write support for the Rust client is deferred.
 
 ## What This Spec Does NOT Change
 

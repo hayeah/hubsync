@@ -14,7 +14,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Client is a read-only replica that syncs from a hub.
+// Client is a replica that syncs from a hub.
+// In write mode, it also pushes local changes back.
 type Client struct {
 	Store   *ClientStore
 	hubURL  string
@@ -22,20 +23,36 @@ type Client struct {
 	syncDir string
 	http    *http.Client
 
+	// Write mode fields
+	writeMode      bool
+	scanInterval   time.Duration
+	localEditPaths map[string]bool // paths with local edits (skip during sync)
+
 	// OnEvent is called after each sync event is applied (for testing).
 	OnEvent func(version int64, path string, op ChangeOp)
+	// OnPush is called after a push completes (for testing).
+	OnPush func(accepted int)
 }
 
 // NewClient creates a Client.
 func NewClient(store *ClientStore, hubURL string, token BearerToken, syncDir string) *Client {
 	return &Client{
-		Store:   store,
-		hubURL:  hubURL,
-		token:   token,
-		syncDir: syncDir,
+		Store:        store,
+		hubURL:       hubURL,
+		token:        token,
+		syncDir:      syncDir,
+		scanInterval: 5 * time.Second,
 		http: &http.Client{
 			Timeout: 0, // no timeout for streaming
 		},
+	}
+}
+
+// SetWriteMode enables write mode with the given scan interval.
+func (c *Client) SetWriteMode(interval time.Duration) {
+	c.writeMode = true
+	if interval > 0 {
+		c.scanInterval = interval
 	}
 }
 
@@ -97,7 +114,15 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 
 // Sync connects to the hub and applies changes. Blocks until ctx is cancelled
 // or the connection drops. Reconnects on failure.
+// In write mode, also runs a periodic push loop.
 func (c *Client) Sync(ctx context.Context) error {
+	if c.writeMode {
+		return c.syncReadWrite(ctx)
+	}
+	return c.syncReadOnly(ctx)
+}
+
+func (c *Client) syncReadOnly(ctx context.Context) error {
 	for {
 		err := c.syncOnce(ctx)
 		if ctx.Err() != nil {
@@ -109,6 +134,64 @@ func (c *Client) Sync(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
+	}
+}
+
+func (c *Client) syncReadWrite(ctx context.Context) error {
+	// Start push loop in background
+	go c.pushLoop(ctx)
+
+	// Run sync stream with reconnect
+	for {
+		// Refresh local edit paths before connecting
+		c.refreshLocalEditPaths()
+
+		err := c.syncOnce(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("sync connection lost: %v, reconnecting in 1s", err)
+
+		// Push any local changes before reconnecting
+		c.doPush()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (c *Client) pushLoop(ctx context.Context) {
+	// Do an initial push immediately
+	c.doPush()
+
+	ticker := time.NewTicker(c.scanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.doPush()
+		}
+	}
+}
+
+func (c *Client) doPush() {
+	accepted, err := c.Push(ConflictPolicy_FAIL)
+	if err != nil {
+		log.Printf("push error: %v", err)
+		return
+	}
+	if accepted > 0 {
+		// Refresh local edit paths after push
+		c.refreshLocalEditPaths()
+	}
+	if c.OnPush != nil {
+		c.OnPush(accepted)
 	}
 }
 
@@ -157,34 +240,37 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 	version := int64(ev.Version)
 	path := ev.Path
 	fullPath := filepath.Join(c.syncDir, path)
+	skipFS := c.skipPath(path)
 
 	switch e := ev.Event.(type) {
 	case *SyncEvent_Change:
 		change := e.Change
 		digest, _ := ParseDigest(fmt.Sprintf("%x", change.Digest))
 
-		// Ensure parent directory exists
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-			return err
-		}
-
-		if len(change.Data) > 0 {
-			// Small file: data is inlined
-			if err := os.WriteFile(fullPath, change.Data, os.FileMode(change.Mode)); err != nil {
+		if !skipFS {
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 				return err
 			}
-		} else {
-			// Large file: try delta if we have an old version, else full fetch
-			if err := c.fetchLargeFile(digest, path, fullPath, os.FileMode(change.Mode)); err != nil {
-				return err
+
+			if len(change.Data) > 0 {
+				// Small file: data is inlined
+				if err := os.WriteFile(fullPath, change.Data, os.FileMode(change.Mode)); err != nil {
+					return err
+				}
+			} else {
+				// Large file: try delta if we have an old version, else full fetch
+				if err := c.fetchLargeFile(digest, path, fullPath, os.FileMode(change.Mode)); err != nil {
+					return err
+				}
 			}
+
+			// Set mtime
+			mtime := time.Unix(change.Mtime, 0)
+			os.Chtimes(fullPath, mtime, mtime)
 		}
 
-		// Set mtime
-		mtime := time.Unix(change.Mtime, 0)
-		os.Chtimes(fullPath, mtime, mtime)
-
-		// Update store
+		// Always update hub_tree (even if we skipped FS write)
 		if err := c.Store.ApplyChange(version, path, OpCreate, FileKind(change.Kind), digest, int64(change.Size), change.Mode, change.Mtime); err != nil {
 			return err
 		}
@@ -194,14 +280,16 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 		}
 
 	case *SyncEvent_Delete:
-		os.Remove(fullPath)
-		// Try to remove empty parent dirs
-		dir := filepath.Dir(fullPath)
-		for dir != c.syncDir {
-			if err := os.Remove(dir); err != nil {
-				break
+		if !skipFS {
+			os.Remove(fullPath)
+			// Try to remove empty parent dirs
+			dir := filepath.Dir(fullPath)
+			for dir != c.syncDir {
+				if err := os.Remove(dir); err != nil {
+					break
+				}
+				dir = filepath.Dir(dir)
 			}
-			dir = filepath.Dir(dir)
 		}
 
 		if err := c.Store.ApplyChange(version, path, OpDelete, FileKindFile, Digest{}, 0, 0, 0); err != nil {

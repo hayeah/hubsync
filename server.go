@@ -33,6 +33,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /blobs/delta", s.auth(s.handleDelta))
 	s.mux.HandleFunc("GET /snapshots/latest", s.auth(s.handleLatestSnapshot))
 	s.mux.HandleFunc("GET /snapshots/{version}", s.auth(s.handleSnapshot))
+	s.mux.HandleFunc("POST /push", s.auth(s.handlePush))
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -197,6 +198,32 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		log.Printf("snapshot generation error: %v", err)
 		// Headers already sent, can't return error to client
 	}
+}
+
+// handlePush processes a PushRequest and returns a PushResponse.
+func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+
+	var req PushRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid protobuf", http.StatusBadRequest)
+		return
+	}
+
+	resp := s.Hub.ProcessPush(&req)
+
+	respData, err := proto.Marshal(resp)
+	if err != nil {
+		http.Error(w, "marshal response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(respData)
 }
 
 // handleDelta receives a DeltaRequest (block signatures from client's old version)

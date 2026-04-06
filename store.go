@@ -68,6 +68,7 @@ func initHubSchema(db *sqlx.DB) error {
 			mtime     INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_change_log_path ON change_log(path);
+
 	`)
 	return err
 }
@@ -187,3 +188,4 @@ func (s *HubStore) LatestVersion() (int64, error) {
 	}
 	return v.Int64, nil
 }
+
