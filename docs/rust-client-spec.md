@@ -304,22 +304,6 @@ let files = try dbQueue.read { db in
 let data = try client.read("images/logo.png")
 ```
 
-## iOS FileProvider Mapping
-
-The hubsync client maps naturally to iOS FileProvider concepts:
-
-| FileProvider | HubSync |
-|---|---|
-| `enumerateItems` | `SELECT FROM hub_tree WHERE path GLOB ?` |
-| `fetchContents` | `client.read(path)` — fetches on demand |
-| `materializedSet` | `content_cache` table (joined with `hub_tree`) |
-| `evictItem` | `DELETE FROM content_cache WHERE digest = ?` |
-| `setFavoriteRank` / keep downloaded | `pinned` table |
-| `currentSyncAnchor` | `sync_state.hub_version` |
-| `enumerateChanges(from:)` | `GET /sync/subscribe?since=N` |
-
-The FileProvider extension would wrap the Rust client via FFI, translating between FileProvider protocol and hubsync operations.
-
 ## Delta Transfer
 
 For large files that the client has a cached old version of, the client uses rsync delta transfer (same as the Go client):
@@ -340,7 +324,4 @@ Falls back to full fetch on failure.
 
 - Write support (push changes back to hub)
 - Filesystem materialization (writing files to disk, for non-iOS use)
-- Background fetch scheduling (iOS BGTaskScheduler integration)
 - Conflict detection (for future read-write mode)
-- Thumbnail / preview generation
-- NSFileProviderItem metadata (UTType, tags, etc.)

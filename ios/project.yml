@@ -1,0 +1,69 @@
+name: HubSync
+
+options:
+  bundleIdPrefix: com.hubsync
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  HubSyncClient:
+    path: Packages/HubSyncClient
+  SwiftUITap:
+    url: https://github.com/hayeah/SwiftUITap.git
+    branch: master
+
+targets:
+  HubSync:
+    type: application
+    platform: iOS
+    sources:
+      - App/Sources
+    resources:
+      - App/Resources
+    dependencies:
+      - package: HubSyncClient
+      - package: SwiftUITap
+      - target: HubSyncFileProvider
+        embed: true
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
+        CFBundleDisplayName: HubSync
+    entitlements:
+      path: App/HubSync.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.hubsync.app
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hubsync.app
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5"
+
+  HubSyncFileProvider:
+    type: app-extension
+    platform: iOS
+    sources:
+      - FileProviderExtension/Sources
+    dependencies:
+      - package: HubSyncClient
+    info:
+      path: FileProviderExtension/Info.plist
+      properties:
+        CFBundleDisplayName: HubSync Files
+        NSExtension:
+          NSExtensionFileProviderDocumentGroup: group.com.hubsync.app
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).HubSyncFileProviderExtension
+    entitlements:
+      path: FileProviderExtension/HubSyncFileProvider.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.hubsync.app
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hubsync.app.fileprovider
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5"

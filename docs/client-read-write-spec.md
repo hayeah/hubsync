@@ -10,18 +10,9 @@ tags:
 
 Extends the read-only sync system (see `docs/spec.md`) with write support. Two permission levels: **read** and **write**.
 
-## Permission Model
+## Authentication
 
-JWT claims carry the permission level. Two levels:
-
-| Level | Allowed |
-|---|---|
-| `read` | Subscribe to sync stream, fetch blobs, download snapshots |
-| `write` | All of `read` + push changes (create, update, delete files) |
-
-The hub checks the JWT `permission` claim on every request. Read endpoints are always allowed. The `POST /push` endpoint requires `write`.
-
-No intermediate "create-only" level — a write client can create, update, and delete files.
+All endpoints require a valid bearer token (`HUBSYNC_TOKEN`). A valid token grants full read/write access — no per-client permission levels.
 
 ## Protocol Additions
 
@@ -88,7 +79,7 @@ message PushConflict {
 
 Request: `PushRequest` protobuf. Response: `PushResponse` protobuf.
 
-Requires `write` permission. Blob content is inline in `PushOp.data`.
+Blob content is inline in `PushOp.data`.
 
 Each `PushOp` carries a `base_version` — the version of the file the client last saw (from its `hub_tree.version` column). The hub uses this for optimistic concurrency:
 
@@ -112,39 +103,7 @@ theirs = blob at current hub version
 ours   = blob from client push
 ```
 
-The hub runs merge strategies in order, stopping on first success:
-
-```
-try_merge(path, base, ours, theirs):
-  for strategy in strategies_for(path):
-    match strategy.merge(base, ours, theirs):
-      Ok(merged)         -> return Ok(merged)
-      Err(NotApplicable) -> continue
-      Err(HasConflicts)  -> continue
-  return Err(Conflict)
-```
-
-### Merge Strategies
-
-- **Text three-way merge** — diff3 on three versions. If no overlapping hunks, produce merged result. Same algorithm as `git merge`.
-- **JSON deep merge** — parse as JSON, merge by key path. Non-overlapping key changes merge cleanly.
-- **Append merge** — if both versions only appended to the base (common prefix matches), concatenate both appendages. Good for log files, CSV.
-- **Last-write-wins** — terminal fallback. Configured per-path, never the global default.
-
-Strategy selection is configurable per-path pattern:
-
-```yaml
-merge:
-  rules:
-    - path: "*.json"
-      strategies: [text, json]
-    - path: "logs/**"
-      strategies: [append, last-write-wins]
-    - path: "**"
-      strategies: [text]
-```
-
-Each strategy is a pure function `(base, ours, theirs) -> merged | error`.
+The hub runs a text three-way merge (diff3) on the three versions. If no overlapping hunks, produce the merged result. Same algorithm as `git merge`. If there are overlapping hunks, return a conflict.
 
 ### Blob Retention for Merge
 
