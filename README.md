@@ -77,10 +77,8 @@ All endpoints require `Authorization: Bearer <token>` when `HUBSYNC_TOKEN` is se
 | GET | `/sync/subscribe?since={version}` | Stream changes as `SyncEvent` messages |
 | GET | `/blobs/{digest}` | Fetch file content by SHA-256 hex digest |
 | POST | `/blobs/delta` | Delta transfer (rsync-style) |
-| GET | `/snapshots/latest` | Redirect to latest snapshot |
-| GET | `/snapshots/{version}` | Download zstd-compressed tarball snapshot |
 | GET | `/snapshots-tree/latest` | Redirect to latest tree-only snapshot |
-| GET | `/snapshots-tree/{version}` | Download just the hub_tree SQLite DB (no file blobs) |
+| GET | `/snapshots-tree/{version}` | Download hub_tree SQLite DB (no file blobs) |
 | POST | `/push` | Push local changes (write mode) |
 
 ### Sync Stream
@@ -123,11 +121,15 @@ Block size heuristic: `sqrt(24 * fileSize)`, clamped to [1KB, 64KB].
 
 ### Bootstrap
 
-New clients (or far-behind clients) download a snapshot tarball from `/snapshots/latest`. The tarball contains all files plus `.hubsync/hub_tree.db` with the materialized state. After extraction, the client resumes incremental sync from the snapshot version.
+New clients bootstrap by fetching the tree DB and then each blob individually:
 
-### Tree-Only Snapshot
+- `GET /snapshots-tree/latest` — download the hub_tree SQLite DB (file metadata + version cursor)
+- Walk the tree, fetch each unique blob via `GET /blobs/{digest}` (deduplicated by digest)
+- Connect to sync stream from the snapshot version for incremental updates
 
-`/snapshots-tree/{version}` serves just the `hub_tree` SQLite DB without file blobs. Useful for clients that only need metadata (e.g. the Rust client which is SQLite-only, no FS writes). Much smaller than a full snapshot — just the tree state and version cursor.
+This is HTTP/2 friendly (parallel blob fetches over one connection) and CDN-cacheable (`/blobs/{digest}` is content-addressed and infinitely cacheable).
+
+For metadata-only clients (e.g. the Rust client which is SQLite-only, no FS writes), just the tree DB fetch is sufficient — skip blob fetching entirely.
 
 ## Database Schema
 

@@ -56,15 +56,32 @@ func (c *Client) SetWriteMode(interval time.Duration) {
 	}
 }
 
-// Bootstrap downloads the latest snapshot and extracts it.
+// Bootstrap fetches the tree DB and all blobs from the hub.
+// Steps: download hub_tree DB from /snapshots-tree/latest, then fetch each blob.
 func (c *Client) Bootstrap(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.hubURL+"/snapshots/latest", nil)
+	// Fetch the tree DB
+	if err := c.bootstrapTreeDB(ctx); err != nil {
+		return err
+	}
+
+	// Fetch all blobs referenced by the tree
+	if err := c.bootstrapBlobs(ctx); err != nil {
+		return err
+	}
+
+	version, _ := c.Store.HubVersion()
+	log.Printf("bootstrap complete, version=%d", version)
+	return nil
+}
+
+func (c *Client) bootstrapTreeDB(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.hubURL+"/snapshots-tree/latest", nil)
 	if err != nil {
 		return err
 	}
 	c.setAuth(req)
 
-	// Follow redirects manually to handle the 302
+	// Follow redirects with auth
 	c.http.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		c.setAuth(req)
 		return nil
@@ -72,32 +89,33 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetch snapshot: %w", err)
+		return fmt.Errorf("fetch tree db: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("snapshot response: %s", resp.Status)
+		return fmt.Errorf("tree db response: %s", resp.Status)
 	}
 
+	// Write the DB to the sync dir
 	dir := c.syncDir
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, ".hubsync"), 0755); err != nil {
 		return err
 	}
 
-	dbPath, err := ExtractSnapshot(resp.Body, dir)
+	dbPath := filepath.Join(dir, ".hubsync", "client.db")
+	dbData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("extract snapshot: %w", err)
+		return fmt.Errorf("read tree db: %w", err)
+	}
+	if err := os.WriteFile(dbPath, dbData, 0644); err != nil {
+		return fmt.Errorf("write tree db: %w", err)
 	}
 
-	if dbPath == "" {
-		return fmt.Errorf("snapshot missing .hubsync/hub_tree.db")
-	}
-
-	// Open the extracted DB and replace our store's DB connection
+	// Open and replace our store
 	db, err := OpenDB(dbPath)
 	if err != nil {
-		return fmt.Errorf("open snapshot db: %w", err)
+		return fmt.Errorf("open tree db: %w", err)
 	}
 
 	newStore, err := NewClientStore(db)
@@ -106,9 +124,63 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 		return err
 	}
 	*c.Store = *newStore
+	return nil
+}
 
-	version, _ := c.Store.HubVersion()
-	log.Printf("bootstrap complete, version=%d", version)
+func (c *Client) bootstrapBlobs(ctx context.Context) error {
+	tree, err := c.Store.TreeSnapshot()
+	if err != nil {
+		return fmt.Errorf("load tree: %w", err)
+	}
+
+	// Deduplicate by digest — multiple paths may share the same content
+	type blobTarget struct {
+		path string
+		mode os.FileMode
+	}
+	byDigest := make(map[Digest][]blobTarget)
+	for path, entry := range tree {
+		if entry.Kind != FileKindFile {
+			continue
+		}
+		byDigest[entry.Digest] = append(byDigest[entry.Digest], blobTarget{path, os.FileMode(entry.Mode)})
+	}
+
+	log.Printf("bootstrap: fetching %d unique blobs for %d files", len(byDigest), len(tree))
+
+	for digest, targets := range byDigest {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Fetch the blob once
+		firstTarget := targets[0]
+		fullPath := filepath.Join(c.syncDir, firstTarget.path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			return err
+		}
+		if err := c.fetchFullBlob(digest, fullPath, firstTarget.mode); err != nil {
+			return fmt.Errorf("fetch blob %s for %s: %w", digest.Hex()[:12], firstTarget.path, err)
+		}
+
+		// Copy to other targets with same digest
+		if len(targets) > 1 {
+			data, err := os.ReadFile(fullPath)
+			if err != nil {
+				return err
+			}
+			for _, t := range targets[1:] {
+				destPath := filepath.Join(c.syncDir, t.path)
+				if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(destPath, data, t.mode); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
