@@ -1,0 +1,15 @@
+# Go
+*.exe
+*.test
+*.out
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# Hub data
+.hubsync/
+
+# OS
+.DS_Store
