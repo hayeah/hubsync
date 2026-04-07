@@ -88,6 +88,7 @@ func cmdClient(args []string) {
 	dbPath := fs.String("db", "", "database path (default: <dir>/.hubsync/client.db)")
 	mode := fs.String("mode", "read", "sync mode: read or write")
 	scanInterval := fs.String("scan-interval", "5s", "scan interval for write mode")
+	once := fs.Bool("once", false, "bootstrap and/or catch up to the hub's current state, then exit")
 	fs.Parse(args)
 
 	if *hubURL == "" {
@@ -96,6 +97,10 @@ func cmdClient(args []string) {
 
 	if *mode != "read" && *mode != "write" {
 		log.Fatalf("-mode must be 'read' or 'write', got %q", *mode)
+	}
+
+	if *once && *mode == "write" {
+		log.Fatal("-once is not supported with -mode write")
 	}
 
 	absDir, err := filepath.Abs(*dir)
@@ -125,6 +130,14 @@ func cmdClient(args []string) {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	if *once {
+		log.Printf("catching up %s from %s", absDir, *hubURL)
+		if err := app.Client.Catchup(ctx); err != nil && ctx.Err() == nil {
+			log.Fatalf("catchup error: %v", err)
+		}
+		return
+	}
 
 	log.Printf("starting client in %s mode, syncing to %s", *mode, absDir)
 

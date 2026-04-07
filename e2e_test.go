@@ -414,6 +414,50 @@ func TestE2ESnapshotTree(t *testing.T) {
 	}
 }
 
+func TestE2ECatchup(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.cleanup()
+
+	// Populate hub
+	env.writeHubFile(t, "a.txt", "alpha")
+	env.writeHubFile(t, "b.txt", "beta")
+	env.writeHubFile(t, "src/main.go", "package main")
+	env.scan(t)
+
+	// First catchup: empty client, should fetch everything
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := env.clientApp.Client.Catchup(ctx); err != nil {
+		t.Fatalf("catchup: %v", err)
+	}
+
+	env.assertClientFile(t, "a.txt", "alpha")
+	env.assertClientFile(t, "b.txt", "beta")
+	env.assertClientFile(t, "src/main.go", "package main")
+
+	v, _ := env.clientApp.Client.Store.HubVersion()
+	if v != 3 {
+		t.Errorf("hub version after catchup: got %d, want 3", v)
+	}
+
+	// Modify hub: add, update, delete
+	time.Sleep(1100 * time.Millisecond)
+	env.writeHubFile(t, "c.txt", "gamma")
+	env.writeHubFile(t, "a.txt", "alpha-updated")
+	env.deleteHubFile(t, "b.txt")
+	env.scan(t)
+
+	// Second catchup: should reconcile
+	if err := env.clientApp.Client.Catchup(ctx); err != nil {
+		t.Fatalf("catchup 2: %v", err)
+	}
+
+	env.assertClientFile(t, "a.txt", "alpha-updated")
+	env.assertClientFileAbsent(t, "b.txt")
+	env.assertClientFile(t, "c.txt", "gamma")
+	env.assertClientFile(t, "src/main.go", "package main")
+}
+
 func TestE2EDeltaTransfer(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.cleanup()

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/hayeah/go-lstree"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -72,6 +73,102 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 	version, _ := c.Store.HubVersion()
 	log.Printf("bootstrap complete, version=%d", version)
 	return nil
+}
+
+// Catchup brings the local FS into sync with the hub's current state, then returns.
+// Reconciles by: fetching the latest tree DB, fetching missing/changed blobs,
+// and removing local files no longer in the tree. Idempotent — safe to re-run.
+func (c *Client) Catchup(ctx context.Context) error {
+	// Fetch the latest tree DB (replaces local hub_tree state)
+	if err := c.bootstrapTreeDB(ctx); err != nil {
+		return err
+	}
+
+	tree, err := c.Store.TreeSnapshot()
+	if err != nil {
+		return fmt.Errorf("load tree: %w", err)
+	}
+
+	// Fetch missing/changed blobs
+	fetched, skipped, err := c.reconcileBlobs(ctx, tree)
+	if err != nil {
+		return err
+	}
+
+	// Remove local files not in the tree
+	deleted, err := c.removeExtraneous(tree)
+	if err != nil {
+		return err
+	}
+
+	version, _ := c.Store.HubVersion()
+	log.Printf("catchup complete, version=%d, fetched=%d, skipped=%d, deleted=%d",
+		version, fetched, skipped, deleted)
+	return nil
+}
+
+// reconcileBlobs fetches blobs for paths whose local content doesn't match hub_tree.
+// Files already on disk with the correct digest are skipped.
+func (c *Client) reconcileBlobs(ctx context.Context, tree map[string]HubTreeEntry) (fetched, skipped int, err error) {
+	for path, entry := range tree {
+		if ctx.Err() != nil {
+			return fetched, skipped, ctx.Err()
+		}
+		if entry.Kind != FileKindFile {
+			continue
+		}
+
+		fullPath := filepath.Join(c.syncDir, path)
+
+		// Check if local file already matches
+		if data, readErr := os.ReadFile(fullPath); readErr == nil {
+			if ComputeDigest(data) == entry.Digest {
+				skipped++
+				continue
+			}
+		}
+
+		// Fetch the blob
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			return fetched, skipped, err
+		}
+		if err := c.fetchFullBlob(entry.Digest, fullPath, os.FileMode(entry.Mode)); err != nil {
+			return fetched, skipped, fmt.Errorf("fetch %s: %w", path, err)
+		}
+		fetched++
+	}
+	return fetched, skipped, nil
+}
+
+// removeExtraneous deletes local files (under syncDir) that are not in the hub_tree.
+// Skips .hubsync/ and respects .gitignore (these are not synced from the hub).
+func (c *Client) removeExtraneous(tree map[string]HubTreeEntry) (int, error) {
+	ignorer, err := ProvideIgnorer(c.syncDir)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	fsys := os.DirFS(c.syncDir)
+	q := lstree.Query{}
+	err = lstree.Walk(fsys, q, ignorer, func(e lstree.Entry) error {
+		if e.IsDir {
+			return nil
+		}
+		if _, inTree := tree[e.Path]; inTree {
+			return nil
+		}
+		fullPath := filepath.Join(c.syncDir, e.Path)
+		if err := os.Remove(fullPath); err != nil {
+			return fmt.Errorf("remove %s: %w", e.Path, err)
+		}
+		deleted++
+		return nil
+	})
+	if err != nil {
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 func (c *Client) bootstrapTreeDB(ctx context.Context) error {

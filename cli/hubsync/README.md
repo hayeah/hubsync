@@ -86,6 +86,7 @@ HUBSYNC_TOKEN=mysecret hubsync client -hub http://localhost:8080 -dir /local/rep
 | `-db` | `<dir>/.hubsync/client.db` | SQLite database path |
 | `-mode` | `read` | Sync mode: `read` or `write` |
 | `-scan-interval` | `5s` | Scan interval for write mode (Go duration string) |
+| `-once` | `false` | Bootstrap and/or catch up to the hub's current state, then exit. Read mode only |
 
 ### First-connect bootstrap
 
@@ -96,6 +97,28 @@ On first run (empty client DB), the client:
 3. Connects to `/sync/subscribe?since={version}` for incremental updates
 
 This is HTTP/2-friendly (parallel blob fetches) and CDN-cacheable.
+
+### One-shot mode (`-once`)
+
+`hubsync client -once` brings the local directory in sync with the hub's current state and exits. Idempotent — safe to re-run.
+
+```bash
+# One-shot sync (e.g. for cron, CI, or scripts)
+hubsync client -hub http://localhost:8090 -dir /local/replica -once
+```
+
+The `-once` flow:
+
+1. Fetches the latest tree DB from `/snapshots-tree/latest`
+2. For each file in the tree: if local content already matches the hub's digest, skip; otherwise fetch via `/blobs/{digest}`
+3. Walks the local directory and removes any files not in the hub tree (respects `.gitignore`, skips `.hubsync/`)
+4. Exits
+
+Logs a summary like `catchup complete, version=42, fetched=3, skipped=17, deleted=1`.
+
+Use this for cron jobs, CI pipelines, or any context where you want a sync run with a definite end. For continuous sync, omit `-once`.
+
+`-once` requires `-mode read`. Combining with `-mode write` is rejected.
 
 ### Write mode behavior
 
