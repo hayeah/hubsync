@@ -18,6 +18,12 @@ RUST_LIB_IOS = RUST_CLIENT / "target/aarch64-apple-ios/release/libhubsync_client
 RUST_HEADER = RUST_CLIENT / "include/hubsync.h"
 XCODEPROJ = Path("HubSync.xcodeproj")
 
+# Binary xcframework consumed by HubSyncRust SPM package as a binaryTarget.
+# Bundles both ios-arm64 and ios-arm64-simulator slices so SPM picks the
+# correct one per build destination (without the dual-`-L` ambiguity).
+XCFRAMEWORK = Path("Packages/HubSyncRust/HubSyncClient.xcframework")
+CHUBSYNC_HEADERS = Path("Packages/HubSyncRust/Sources/CHubSync/include")
+
 # Cargo needs PATH to find rustup toolchain
 CARGO_ENV = "PATH=$HOME/.cargo/bin:$PATH"
 
@@ -41,6 +47,25 @@ def rust_ios():
 
 
 @task(
+    inputs=[rust_sim, rust_ios, *CHUBSYNC_HEADERS.glob("*.h"), CHUBSYNC_HEADERS / "module.modulemap"],
+    outputs=[XCFRAMEWORK / "Info.plist"],
+)
+def xcframework():
+    """Bundle both Rust slices + headers into HubSyncClient.xcframework.
+
+    HubSyncRust/Package.swift consumes this as a `.binaryTarget` so SPM picks
+    the right slice per destination (sim vs device) without -L ambiguity.
+    """
+    sh(f"rm -rf {XCFRAMEWORK}")
+    sh(
+        "xcodebuild -create-xcframework"
+        f" -library {RUST_LIB_IOS} -headers {CHUBSYNC_HEADERS}"
+        f" -library {RUST_LIB_SIM} -headers {CHUBSYNC_HEADERS}"
+        f" -output {XCFRAMEWORK}"
+    )
+
+
+@task(
     inputs=[Path("project.yml")],
     outputs=[XCODEPROJ / "project.pbxproj"],
 )
@@ -49,7 +74,7 @@ def xcodegen():
     sh("xcodegen generate")
 
 
-@task(inputs=[rust_sim, xcodegen])
+@task(inputs=[xcframework, xcodegen])
 def build_sim():
     """Build iOS app for simulator."""
     sh(
@@ -59,7 +84,7 @@ def build_sim():
     )
 
 
-@task(inputs=[rust_ios, xcodegen])
+@task(inputs=[xcframework, xcodegen])
 def build_device():
     """Build iOS app for device."""
     sh(

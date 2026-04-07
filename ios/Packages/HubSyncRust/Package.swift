@@ -1,14 +1,12 @@
 // swift-tools-version: 6.0
 import PackageDescription
-import Foundation
 
-// Resolve absolute path: Package.swift is at ios/Packages/HubSyncRust/
-// rust-client is at <repo>/rust-client, so 3 levels up
-let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-let rustClientDir = packageDir
-    .appendingPathComponent("../../../rust-client")
-    .standardized.path
-
+// CHubSync is shipped as a binary xcframework that bundles both the
+// iOS-device (aarch64-apple-ios) and iOS-simulator (aarch64-apple-ios-sim)
+// slices of libhubsync_client.a built from ../../rust-client.
+//
+// Rebuild with: cd ../.. && pymake xcframework  (in hubsync/ios)
+// The xcframework is gitignored — fresh checkouts must regenerate it.
 let package = Package(
     name: "HubSyncRust",
     platforms: [.iOS(.v17)],
@@ -16,16 +14,9 @@ let package = Package(
         .library(name: "HubSyncRust", targets: ["HubSyncRust"]),
     ],
     targets: [
-        .target(
+        .binaryTarget(
             name: "CHubSync",
-            publicHeadersPath: "include",
-            linkerSettings: [
-                .unsafeFlags([
-                    "-L\(rustClientDir)/target/aarch64-apple-ios-sim/release",
-                    "-L\(rustClientDir)/target/aarch64-apple-ios/release",
-                ]),
-                .linkedLibrary("hubsync_client"),
-            ]
+            path: "HubSyncClient.xcframework"
         ),
         .target(
             name: "HubSyncRust",
