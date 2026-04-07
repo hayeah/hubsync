@@ -23,6 +23,9 @@ HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/r
 
 # Start read-write client (pushes local changes back)
 HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica -mode write
+
+# One-shot sync (bootstrap and/or catch up, then exit)
+HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica -once
 ```
 
 ## CLI
@@ -48,6 +51,7 @@ Start a sync client.
 | `-db` | `<dir>/.hubsync/client.db` | SQLite database path |
 | `-mode` | `read` | `read` or `write` |
 | `-scan-interval` | `5s` | How often to scan for local changes (write mode) |
+| `-once` | `false` | Bootstrap and/or catch up to the hub's current state, then exit (read mode only) |
 
 ### Environment Variables
 
@@ -119,6 +123,18 @@ For large file updates, the client sends block signatures (rolling hash + SHA-25
 
 Block size heuristic: `sqrt(24 * fileSize)`, clamped to [1KB, 64KB].
 
+### One-shot mode
+
+`hubsync client -once` performs a single reconciliation pass and exits — useful for cron, CI, or scripts:
+
+1. Fetches the latest tree DB
+2. Skips local files whose digest already matches the hub
+3. Fetches missing/changed blobs
+4. Removes local files no longer in the tree
+5. Exits with a summary like `catchup complete, version=42, fetched=3, skipped=17, deleted=1`
+
+Idempotent — safe to re-run. Read mode only.
+
 ### Bootstrap
 
 New clients bootstrap by fetching the tree DB and then each blob individually:
@@ -163,6 +179,25 @@ CREATE TABLE hub_tree (
 ```
 
 The `version` column in `hub_tree` is the change_log version that last touched this entry — used as `base_version` when pushing.
+
+## Other Clients
+
+### Rust client (`rust-client/`)
+
+A metadata-only client (no FS materialization) intended for embedding via FFI in mobile/desktop apps. It maintains the `hub_tree` SQLite DB and fetches blobs lazily on demand via `read(path)`. Bootstraps via `/snapshots-tree/latest` (no blob prefetching).
+
+Exposes a C FFI (`hubsync.h`) with a separate bootstrap callback for progress reporting:
+
+```c
+typedef void (*HubSyncBootstrapCallback)(uint64_t count, uint64_t total, void *ctx);
+```
+
+- `(0, N)` — tree import complete with N entries
+- `(count, total)` — blob fetch progress (currently unused — Rust client is metadata-only)
+
+### iOS app (`ios/`)
+
+SwiftUI app that wraps the Rust client via a Swift FFI bridge. Includes a FileProvider extension so the synced files appear in the iOS Files app. Build pipeline at `ios/Makefile.py`.
 
 ## Key Implementation Details
 
