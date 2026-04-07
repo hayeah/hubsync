@@ -1,12 +1,14 @@
 # Hub Sync: Read-Only Client Spec
 
-A hub-to-client file synchronization system. The hub is authoritative; the client is a read-only replica. No push, no conflicts, no merge.
+A hub-to-client file synchronization system. The hub is authoritative; the client is a read-only replica. Files are opaque blobs — no content-level merging.
+
+For write mode (clients pushing local changes back), see `client-read-write-spec.md`.
 
 ## Overview
 
 - Hub watches a directory, maintains a versioned change log in SQLite
 - Clients subscribe to a stream of changes and apply them locally
-- First-connect bootstraps from a snapshot tarball containing a ready-to-use SQLite DB
+- First-connect bootstraps by fetching the tree DB (`/snapshots-tree/latest`) then individual blobs via `/blobs/{digest}` (HTTP/2 friendly, CDN-cacheable)
 - Incremental sync via length-prefixed protobuf stream over HTTP
 - Bearer token authentication via `HUBSYNC_TOKEN` env var
 
@@ -86,19 +88,9 @@ When processing a batch of filesystem changes, the hub emits creates/updates bef
 
 Uses `fsnotify` with 50ms debounce. When events fire, a full scan is triggered on the changed paths. If the watcher overflows or errors, a full scan covers everything.
 
-### Snapshots
+### Tree Snapshots
 
-For first-connect and far-behind clients. A snapshot is a zstd-compressed tarball of the full tree at a given version.
-
-```
-snapshot at version 500:
-  .hubsync/hub_tree.db     <- SQLite DB: hub_tree + sync_state tables
-  README.md
-  src/main.go
-  ...
-```
-
-The `.hubsync/hub_tree.db` is a **projection** of current state — no change log. Just the materialized tree and version cursor:
+For first-connect and far-behind clients. A tree snapshot is just the materialized tree as a SQLite DB — no file blobs. Clients fetch blobs separately by digest.
 
 ```sql
 CREATE TABLE hub_tree (
@@ -120,11 +112,13 @@ CREATE TABLE sync_state (
 -- row: ('hub_version', '500')
 ```
 
-Snapshots are generated on-demand when a client requests one.
+Tree snapshots are generated on-demand when a client requests one. The hub serializes its in-memory tree into a fresh SQLite DB and serves it as a single response. No tarball, no compression — SQLite is already compact.
+
+This design is HTTP/2 friendly (clients can fetch many blobs in parallel over one connection) and CDN-cacheable (`/blobs/{digest}` is content-addressed and infinitely cacheable). Clients that only need metadata (e.g. the Rust client which is SQLite-only, no FS writes) skip the blob fetches entirely.
 
 ### Log Compaction
 
-Not yet implemented. The hub can drop change_log entries older than the oldest snapshot.
+Not yet implemented. The hub could drop old change_log entries past a retention window.
 
 ---
 
@@ -221,13 +215,17 @@ Request: `DeltaRequest` protobuf body. Response: `DeltaResponse` protobuf body.
 
 For large files the client has a previous version of. Client sends rsync block signatures of its local copy, hub computes delta against the target file and responds with delta ops.
 
-#### `GET /snapshots/latest`
+#### `GET /snapshots-tree/latest`
 
-302 redirect to `/snapshots/{version}`.
+302 redirect to `/snapshots-tree/{version}`.
 
-#### `GET /snapshots/{version}`
+#### `GET /snapshots-tree/{version}`
 
-Zstd-compressed tarball with SQLite DB + file content.
+Serves the hub_tree SQLite DB at the given version. Just the tree and version cursor — no file blobs. Clients fetch blobs separately via `/blobs/{digest}`.
+
+#### `POST /push`
+
+See `client-read-write-spec.md`. Used by write-mode clients to push local changes back.
 
 ---
 
@@ -281,21 +279,31 @@ If a match is found, copy the local file instead of fetching from the hub. This 
 ```
 Client                                    Hub
   |                                         |
-  |-- GET /snapshots/latest ------------> |
-  | <-- 302 /snapshots/500 -------------- |
+  |-- GET /snapshots-tree/latest --------> |
+  | <-- 302 /snapshots-tree/500 ---------- |
   |                                         |
-  |-- GET /snapshots/500 ----------------> |
-  | <---- tarball stream ---------------   |
+  |-- GET /snapshots-tree/500 -----------> |
+  | <---- SQLite DB body ----------------- |
   |                                         |
-  [extract tarball to local FS]             |
-  [open .hubsync/hub_tree.db as client DB] |
+  [import tree DB into client's hub_tree]   |
   [hub_version=500, tree ready]            |
+  |                                         |
+  [for each unique digest in tree:]         |
+  |-- GET /blobs/{digest} ---------------> |
+  | <---- blob content ------------------- |
+  | ...                                     |
   |                                         |
   |-- GET /sync/subscribe?since=500 -----> |
   | <-- stream: events 501.. ------------- |
 ```
 
-Zero import step. The SQLite DB from the tarball is the client's DB. Open it and go.
+Two-step bootstrap:
+1. Fetch the tree DB — cheap, one round trip, gives the client all metadata
+2. Walk the tree, fetch each unique blob via `/blobs/{digest}` — deduplicated by digest, parallelizable over HTTP/2
+
+Then resume incremental sync from the snapshot version.
+
+Metadata-only clients (e.g. Rust client) can skip step 2 entirely and fetch blobs lazily on demand.
 
 #### Incremental Sync
 
@@ -380,13 +388,16 @@ When writing files (from snapshot extraction or SyncEvent), the client sets the 
 # Start hub server
 HUBSYNC_TOKEN=secret hubsync serve -dir /some/dir -listen 127.0.0.1:8080
 
-# Start client sync
+# Start read-only client sync
 HUBSYNC_TOKEN=secret hubsync client -hub http://localhost:8080 -dir /replica
+
+# Start read-write client (pushes local changes back)
+HUBSYNC_TOKEN=secret hubsync client -hub http://localhost:8080 -dir /replica -mode write
 ```
 
 Flags:
 - `serve`: `-dir` (directory to watch, default `.`), `-listen` (address, default `127.0.0.1:8080`), `-db` (database path, default `<dir>/.hubsync/hub.db`)
-- `client`: `-hub` (hub URL, required), `-dir` (sync directory, default `.`), `-db` (database path, default `<dir>/.hubsync/client.db`)
+- `client`: `-hub` (hub URL, required), `-dir` (sync directory, default `.`), `-db` (database path, default `<dir>/.hubsync/client.db`), `-mode` (`read` or `write`, default `read`), `-scan-interval` (write mode scan interval, default `5s`)
 
 ---
 
@@ -404,15 +415,19 @@ Flags:
 
 ---
 
-## What's Deferred (Read-Write Mode)
+## Read-Write Mode
 
-These are explicitly out of scope for the read-only implementation, to be added later:
+Implemented — see `client-read-write-spec.md`. Highlights:
 
-- `POST /push` endpoint
+- `POST /push` endpoint with optimistic concurrency (`base_version`)
 - PushOp, PushRequest, PushResponse protobuf messages
-- Hub-side auto-merge (text 3-way, JSON deep merge, append merge)
-- Conflict resolution (hub-wins, client-wins, fork, retry)
-- Permission model (read, read+create, read+write+create)
-- Client-side local tree scanning and diffing
-- Client-side filesystem watcher
+- No content-level merging — files are opaque blobs (like Dropbox/mutagen)
+- Conflict policies: `FAIL` (default), `HUB_WINS`, `CLIENT_WINS`
+- On conflict, client renames local file to `(conflicted copy)` and fetches the hub's version
+- Client-side local tree scanning and diff against `hub_tree`
+- Periodic scan + push loop in write mode
+
+## Still Deferred
+
+- Client-side filesystem watcher (currently timer-based scanning only)
 - Log compaction / GC
