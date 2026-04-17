@@ -28,6 +28,37 @@ HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/r
 HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica -once
 ```
 
+## Backblaze B2 archive
+
+Optionally, a hub can back itself up to Backblaze B2 and let the operator evict local copies via `hubsync unpin`. Enable by adding an `[archive]` section to `.hubsync/config.toml`:
+
+```toml
+[hub]
+hash = "xxh128"                         # or "sha256"; set once at init
+
+[archive]
+provider      = "b2"
+bucket        = "my-bucket"
+bucket_prefix = "backups/laptop-home/"
+# b2_key_id   = "..."                   # falls back to B2_APPLICATION_KEY_ID env
+# b2_app_key  = "..."                   # falls back to B2_APPLICATION_KEY env
+# archive_workers = 4
+```
+
+When the config is present, `hubsync serve` starts an archive worker that uploads every file under the hub directory to `<bucket>/<bucket_prefix>`. Each upload stamps `X-Bz-Info-hubsync_digest` + `X-Bz-Info-hubsync_digest_algo` so an operator (or a future `fsck`) can cross-check content.
+
+Operator verbs all talk to a running `hubsync serve` over `.hubsync/serve.sock`:
+
+```bash
+hubsync ls                              # virtual listing incl. unpinned entries
+hubsync status                          # tree + archive counts
+hubsync pin   'big.bin'                 # ensure the file is archived + local
+hubsync unpin 'big.bin'                 # ensure it's archived, then evict local
+hubsync unpin '**/*.tmp'  --dry         # show the plan, mutate nothing
+```
+
+**Pin state is a data-fetch concern, not a tree-visibility concern.** Clients still see unpinned rows in `hub_tree`; `GET /blobs/{digest}` on a hub whose local copy is gone transparently returns a 302 to a short-lived presigned B2 URL.
+
 ## CLI
 
 ### `hubsync serve`
@@ -53,21 +84,56 @@ Start a sync client.
 | `-scan-interval` | `5s` | How often to scan for local changes (write mode) |
 | `-once` | `false` | Bootstrap and/or catch up to the hub's current state, then exit (read mode only) |
 
+### `hubsync pin` / `hubsync unpin`
+
+Declarative commands; the argument is a doublestar glob, the command is the target state.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-dir` | `.` | Hub directory (walks up looking for `.hubsync/`) |
+| `--dry` | `false` | Print the reconciler plan per path; do not mutate |
+
+Both require a running `hubsync serve` in the same hub. `--dry` must precede the glob (Go's `flag` package stops at the first positional).
+
+### `hubsync ls`
+
+Virtual listing from the hub's registry (including unpinned rows).
+
+| Flag | Default | Description |
+|---|---|---|
+| `-dir` | `.` | Hub directory |
+| `--long` | `false` | Include size + B2 fileId prefix |
+
+State flag per row: `a` archived, `u` unpinned, `d` dirty, `-` pre-archive (NULL).
+
+### `hubsync status`
+
+Grouped archive counts.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-dir` | `.` | Hub directory |
+| `--json` | `false` | Machine-readable output |
+
 ### Environment Variables
 
 | Variable | Description |
 |---|---|
 | `HUBSYNC_TOKEN` | Bearer token for auth. Set on both hub and client. If unset on hub, no auth required. |
+| `B2_APPLICATION_KEY_ID` | B2 app key ID (falls back from `[archive] b2_key_id` in config.toml) |
+| `B2_APPLICATION_KEY` | B2 app key secret (falls back from `[archive] b2_app_key`) |
 
 ## Architecture
 
 ```
-Hub Server                        Client(s)
-+- HubStore (SQLite change_log)   +- ClientStore (SQLite hub_tree)
-+- Scanner (lstree, .gitignore)   +- Sync stream consumer
-+- Watcher (fsnotify, 50ms)       +- Push loop (write mode)
-+- Broadcaster (channels)         +- Delta engine (rsync)
-+- HTTP Server                    +- Conflicted copy handler
+Hub Server                              Client(s)
++- HubStore (change_log + hub_entry)    +- ClientStore (hub_tree)
++- Scanner (lstree, .gitignore)         +- Sync stream consumer
++- Watcher (fsnotify, 50ms)             +- Push loop (write mode)
++- Broadcaster (channels)               +- Delta engine (rsync)
++- HTTP Server                          +- Conflicted copy handler
++- ArchiveWorker  (optional, B2)
++- RPCServer (unix socket, pin/unpin)
 ```
 
 ## Protocol
@@ -79,7 +145,7 @@ All endpoints require `Authorization: Bearer <token>` when `HUBSYNC_TOKEN` is se
 | Method | Path | Description |
 |---|---|---|
 | GET | `/sync/subscribe?since={version}` | Stream changes as `SyncEvent` messages |
-| GET | `/blobs/{digest}` | Fetch file content by SHA-256 hex digest |
+| GET | `/blobs/{digest}` | Fetch file content by raw-hash hex digest (xxh128 or sha256). For unpinned paths on archive-configured hubs, returns `302` to a presigned B2 URL. |
 | POST | `/blobs/delta` | Delta transfer (rsync-style) |
 | GET | `/snapshots-tree/latest` | Redirect to latest tree-only snapshot |
 | GET | `/snapshots-tree/{version}` | Download hub_tree SQLite DB (no file blobs) |
@@ -149,6 +215,8 @@ For metadata-only clients (e.g. the Rust client which is SQLite-only, no FS writ
 
 ## Database Schema
 
+All digests are raw-hash `BLOB` values. Length depends on `[hub] hash`: 16 bytes for xxh128 (default on new hubs), 32 bytes for sha256. Read with `SELECT hex(digest) …` in the sqlite3 shell.
+
 ### Hub: `change_log` (append-only)
 
 ```sql
@@ -157,12 +225,33 @@ CREATE TABLE change_log (
   path      TEXT NOT NULL,
   op        TEXT NOT NULL CHECK(op IN ('create', 'update', 'delete')),
   kind      INTEGER NOT NULL DEFAULT 0,
-  digest    TEXT,
+  digest    BLOB,
   size      INTEGER,
   mode      INTEGER,
   mtime     INTEGER NOT NULL
 );
 ```
+
+### Hub: `hub_entry` (materialized tree + archive state)
+
+```sql
+CREATE TABLE hub_entry (
+  path                TEXT PRIMARY KEY,
+  kind                INTEGER NOT NULL,
+  digest              BLOB,
+  size                INTEGER,
+  mode                INTEGER,
+  mtime               INTEGER,
+  version             INTEGER NOT NULL,
+  archive_state       TEXT,           -- NULL | 'dirty' | 'archived' | 'unpinned'
+  archive_file_id     TEXT,
+  archive_sha1        BLOB,
+  archive_uploaded_at INTEGER,
+  updated_at          INTEGER NOT NULL
+);
+```
+
+Scanner/watcher own `path, kind, digest, size, mode, mtime, version`. Archive worker owns the `archive_*` columns. No column is shared.
 
 ### Client: `hub_tree` (materialized state)
 
@@ -170,13 +259,15 @@ CREATE TABLE change_log (
 CREATE TABLE hub_tree (
   path    TEXT PRIMARY KEY,
   kind    INTEGER NOT NULL DEFAULT 0,
-  digest  TEXT,
+  digest  BLOB,
   size    INTEGER,
   mode    INTEGER,
   mtime   INTEGER,
   version INTEGER NOT NULL
 );
 ```
+
+The snapshot shipped to clients via `/snapshots-tree/{version}` carries a `sync_state.hash_algo` row so clients can pick the right streaming hash for local content checks.
 
 The `version` column in `hub_tree` is the change_log version that last touched this entry — used as `base_version` when pushing.
 
@@ -230,22 +321,32 @@ protocol.go             # Length-prefixed protobuf I/O
 auth.go                 # Bearer token auth middleware
 config.go               # HubConfig, ClientConfig
 providers.go            # Wire dependency providers
-cli/hubsync/main.go     # CLI entry point
+cli/hubsync/main.go     # CLI entry point (serve, client, pin, unpin, ls, status)
+archive/archive.go      # ArchiveStorage interface + hubsync fileInfo keys
+archive/b2store.go      # blazer-backed ArchiveStorage
+archive/fake.go         # in-memory ArchiveStorage for tests
+archive_worker.go       # Worker that drains NULL/dirty rows to B2
+reconciler.go           # Pin/unpin declarative reconciler
+rpc.go                  # Unix-socket RPC server + client
+config_file.go          # .hubsync/config.toml loader
+hasher.go               # Hasher interface (xxh128, sha256)
 docs/spec.md            # Full read-only protocol spec
 docs/client-read-write-spec.md  # Write mode spec
+AGENTS.md               # Testing process for AI agents
 ```
 
 ## Testing
 
+See **AGENTS.md** for the three testing tiers (unit, live-bucket integration, manual smoke). Quick reference:
+
 ```bash
-# Run all tests
-go test -v -timeout 120s
+# Tier 1 — unit + e2e, no network
+go test ./...
 
-# Run push/write mode tests only
-go test -run TestE2EPush -v
+# Tier 2 — live B2 (gated on env)
+HUBSYNC_TEST_BUCKET=hayeah-hubsync-test godotenv -f ~/.env.secret go test -v ./archive/
 
-# Run specific test
-go test -run TestE2EWriteMode -v
+# Tier 3 — full serve + CLI smoke: see AGENTS.md
 ```
 
-E2E tests spin up an in-process hub + httptest server + client. No external dependencies needed.
+E2E tests spin up an in-process hub + httptest server + client. Archive worker / reconciler / RPC tests use `archive.FakeStorage`. Live-bucket tests skip cleanly when the three env vars (`B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`, `HUBSYNC_TEST_BUCKET`) aren't all set.
