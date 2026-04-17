@@ -8,42 +8,55 @@ import (
 	"fmt"
 )
 
-// Digest is a SHA-256 content hash stored as raw bytes.
-type Digest [sha256.Size]byte
+// Digest is a content hash stored as raw bytes. Length depends on the hub's
+// configured [hub] hash algorithm: 16 bytes for xxh128, 32 bytes for sha256.
+//
+// Represented as string so it's immutable, comparable, and usable as a map
+// key with no allocation. Convert to/from []byte with `Digest(b)` and
+// `[]byte(d)` (SQLite BLOBs round-trip as []byte).
+type Digest string
 
-// ComputeDigest returns the SHA-256 digest of data.
-func ComputeDigest(data []byte) Digest {
-	return sha256.Sum256(data)
-}
+// NewDigest copies b into a Digest. The returned Digest aliases no memory
+// with b (string conversion copies).
+func NewDigest(b []byte) Digest { return Digest(b) }
+
+// Bytes returns the digest as []byte. The result must not be mutated.
+func (d Digest) Bytes() []byte { return []byte(d) }
 
 // Hex returns the lowercase hex encoding of the digest.
-func (d Digest) Hex() string {
-	return hex.EncodeToString(d[:])
-}
+func (d Digest) Hex() string { return hex.EncodeToString([]byte(d)) }
 
 // String implements fmt.Stringer.
-func (d Digest) String() string {
-	return d.Hex()
-}
+func (d Digest) String() string { return d.Hex() }
 
-// ParseDigest decodes a hex string into a Digest.
+// ParseDigest decodes a hex string into a Digest. Accepts any even-length
+// hex input; callers that need a specific algo length should check Size().
 func ParseDigest(s string) (Digest, error) {
-	var d Digest
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return d, fmt.Errorf("invalid digest hex: %w", err)
+		return "", fmt.Errorf("invalid digest hex: %w", err)
 	}
-	if len(b) != sha256.Size {
-		return d, fmt.Errorf("invalid digest length: got %d, want %d", len(b), sha256.Size)
-	}
-	copy(d[:], b)
-	return d, nil
+	return Digest(b), nil
 }
 
-// IsZero reports whether the digest is all zeros (unset).
-func (d Digest) IsZero() bool {
-	return d == Digest{}
+// IsZero reports whether the digest is empty (unset).
+func (d Digest) IsZero() bool { return len(d) == 0 }
+
+// Size returns the digest's byte length.
+func (d Digest) Size() int { return len(d) }
+
+// SHA256Digest returns the SHA-256 digest of data. Test/fixture helper; in
+// production code paths, use a configured Hasher instead.
+func SHA256Digest(data []byte) Digest {
+	s := sha256.Sum256(data)
+	return Digest(s[:])
 }
+
+// ComputeDigest is a deprecated alias for SHA256Digest kept for in-tree
+// tests. Production code paths should use a configured Hasher.
+//
+// Deprecated: use SHA256Digest or a Hasher.
+func ComputeDigest(data []byte) Digest { return SHA256Digest(data) }
 
 // FileKind describes the type of a filesystem entry.
 // Maps to the protobuf FileKind enum.

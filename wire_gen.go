@@ -14,23 +14,31 @@ import (
 
 // InitializeTestHubApp creates a HubApp for testing.
 func InitializeTestHubApp(cfg *HubConfig) (*HubApp, func(), error) {
-	hubStore, cleanup, err := ProvideHubStore(cfg)
+	hasher, err := ProvideHubHasher(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	scanner, err := ProvideScanner(cfg)
+	hubStoreConfig := ProvideHubStoreConfig(cfg, hasher)
+	hubStore, cleanup, err := NewHubStore(hubStoreConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	scannerConfig, err := ProvideScannerConfig(cfg, hasher)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	watcher, cleanup2, err := ProvideWatcher(cfg)
+	scanner := NewScanner(scannerConfig)
+	watcherConfig := ProvideWatcherConfig(cfg)
+	watcher, cleanup2, err := NewWatcher(watcherConfig)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 	broadcaster := NewBroadcaster()
-	hub := NewHub(hubStore, scanner, watcher, broadcaster)
-	server := ProvideServer(hub, cfg)
+	hub := NewHub(hubStore, scanner, watcher, broadcaster, hasher)
+	serverConfig := ProvideServerConfig(cfg, hasher)
+	server := NewServer(hub, serverConfig)
 	hubApp := &HubApp{
 		Server: server,
 		Hub:    hub,
@@ -43,7 +51,8 @@ func InitializeTestHubApp(cfg *HubConfig) (*HubApp, func(), error) {
 
 // InitializeTestClientApp creates a ClientApp for testing.
 func InitializeTestClientApp(cfg *ClientConfig) (*ClientApp, func(), error) {
-	clientStore, cleanup, err := ProvideClientStore(cfg)
+	clientStoreConfig := ProvideClientStoreConfig(cfg)
+	clientStore, cleanup, err := OpenClientStore(clientStoreConfig)
 	if err != nil {
 		return nil, nil, err
 	}

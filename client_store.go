@@ -7,12 +7,13 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-// ClientStore manages the client's SQLite database: hub_tree and sync_state.
+// ClientStore manages the client's SQLite database: hub_tree + sync_state.
 type ClientStore struct {
 	DB *sqlx.DB
 }
 
-// NewClientStore creates a ClientStore and initializes the schema.
+// NewClientStore creates a ClientStore and initializes the schema against an
+// already-opened DB. For wire integration, use OpenClientStore.
 func NewClientStore(db *sqlx.DB) (*ClientStore, error) {
 	if err := initClientSchema(db); err != nil {
 		return nil, err
@@ -20,12 +21,27 @@ func NewClientStore(db *sqlx.DB) (*ClientStore, error) {
 	return &ClientStore{DB: db}, nil
 }
 
+// OpenClientStore opens the client DB, initializes the schema, and returns a
+// cleanup func. This is the wire-provided constructor.
+func OpenClientStore(cfg ClientStoreConfig) (*ClientStore, func(), error) {
+	db, err := OpenDB(cfg.DBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := NewClientStore(db)
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	return s, func() { db.Close() }, nil
+}
+
 func initClientSchema(db *sqlx.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS hub_tree (
 			path    TEXT PRIMARY KEY,
 			kind    INTEGER NOT NULL DEFAULT 0,
-			digest  TEXT,
+			digest  BLOB,
 			size    INTEGER,
 			mode    INTEGER,
 			mtime   INTEGER,
@@ -65,16 +81,38 @@ func (s *ClientStore) SetHubVersion(version int64) error {
 	return err
 }
 
+// HashAlgo returns the hub's configured hash algorithm (propagated via
+// snapshot). Empty if the snapshot didn't carry the value.
+func (s *ClientStore) HashAlgo() (string, error) {
+	var v sql.NullString
+	err := s.DB.Get(&v, `SELECT value FROM sync_state WHERE key = 'hash_algo'`)
+	if err == sql.ErrNoRows || !v.Valid {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// SetHashAlgo stores the hub's configured hash algorithm.
+func (s *ClientStore) SetHashAlgo(algo string) error {
+	_, err := s.DB.Exec(
+		`INSERT OR REPLACE INTO sync_state (key, value) VALUES ('hash_algo', ?)`,
+		algo,
+	)
+	return err
+}
+
 // UpsertEntry inserts or replaces an entry in hub_tree.
 func (s *ClientStore) UpsertEntry(path string, kind FileKind, digest Digest, size int64, mode uint32, mtime int64, version int64) error {
-	var digestHex *string
+	var digestBlob []byte
 	if !digest.IsZero() {
-		h := digest.Hex()
-		digestHex = &h
+		digestBlob = digest.Bytes()
 	}
 	_, err := s.DB.Exec(
 		`INSERT OR REPLACE INTO hub_tree (path, kind, digest, size, mode, mtime, version) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		path, int(kind), digestHex, size, mode, mtime, version,
+		path, int(kind), digestBlob, size, mode, mtime, version,
 	)
 	return err
 }
@@ -87,11 +125,13 @@ func (s *ClientStore) DeleteEntry(path string) error {
 
 // LookupByDigest finds a path with the given digest (for dedup/copy).
 func (s *ClientStore) LookupByDigest(digest Digest, excludePath string) (string, bool, error) {
-	h := digest.Hex()
+	if digest.IsZero() {
+		return "", false, nil
+	}
 	var path string
 	err := s.DB.Get(&path,
 		`SELECT path FROM hub_tree WHERE digest = ? AND path != ? LIMIT 1`,
-		h, excludePath,
+		digest.Bytes(), excludePath,
 	)
 	if err == sql.ErrNoRows {
 		return "", false, nil
@@ -104,13 +144,13 @@ func (s *ClientStore) LookupByDigest(digest Digest, excludePath string) (string,
 
 // hubTreeRow represents a row from the hub_tree table.
 type hubTreeRow struct {
-	Path    string         `db:"path"`
-	Kind    int            `db:"kind"`
-	Digest  sql.NullString `db:"digest"`
-	Size    int64          `db:"size"`
-	Mode    uint32         `db:"mode"`
-	MTime   int64          `db:"mtime"`
-	Version int64          `db:"version"`
+	Path    string `db:"path"`
+	Kind    int    `db:"kind"`
+	Digest  []byte `db:"digest"`
+	Size    int64  `db:"size"`
+	Mode    uint32 `db:"mode"`
+	MTime   int64  `db:"mtime"`
+	Version int64  `db:"version"`
 }
 
 // HubTreeEntry represents an entry in the client's hub_tree with its version.
@@ -127,20 +167,17 @@ func (s *ClientStore) TreeSnapshot() (map[string]HubTreeEntry, error) {
 	}
 	result := make(map[string]HubTreeEntry, len(rows))
 	for _, r := range rows {
-		entry := HubTreeEntry{
+		result[r.Path] = HubTreeEntry{
 			TreeEntry: TreeEntry{
-				Path: r.Path,
-				Kind: FileKind(r.Kind),
-				Size: r.Size,
-				Mode: r.Mode,
-				MTime: r.MTime,
+				Path:   r.Path,
+				Kind:   FileKind(r.Kind),
+				Digest: Digest(r.Digest),
+				Size:   r.Size,
+				Mode:   r.Mode,
+				MTime:  r.MTime,
 			},
 			Version: r.Version,
 		}
-		if r.Digest.Valid {
-			entry.Digest, _ = ParseDigest(r.Digest.String)
-		}
-		result[r.Path] = entry
 	}
 	return result, nil
 }
@@ -155,20 +192,17 @@ func (s *ClientStore) LookupEntry(path string) (HubTreeEntry, bool, error) {
 	if err != nil {
 		return HubTreeEntry{}, false, err
 	}
-	entry := HubTreeEntry{
+	return HubTreeEntry{
 		TreeEntry: TreeEntry{
-			Path: r.Path,
-			Kind: FileKind(r.Kind),
-			Size: r.Size,
-			Mode: r.Mode,
-			MTime: r.MTime,
+			Path:   r.Path,
+			Kind:   FileKind(r.Kind),
+			Digest: Digest(r.Digest),
+			Size:   r.Size,
+			Mode:   r.Mode,
+			MTime:  r.MTime,
 		},
 		Version: r.Version,
-	}
-	if r.Digest.Valid {
-		entry.Digest, _ = ParseDigest(r.Digest.String)
-	}
-	return entry, true, nil
+	}, true, nil
 }
 
 // ApplyChange applies a single sync event to the client store within a transaction.
@@ -184,14 +218,13 @@ func (s *ClientStore) ApplyChange(version int64, path string, op ChangeOp, kind 
 			return err
 		}
 	} else {
-		var digestHex *string
+		var digestBlob []byte
 		if !digest.IsZero() {
-			h := digest.Hex()
-			digestHex = &h
+			digestBlob = digest.Bytes()
 		}
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO hub_tree (path, kind, digest, size, mode, mtime, version) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			path, int(kind), digestHex, size, mode, mtime, version,
+			path, int(kind), digestBlob, size, mode, mtime, version,
 		); err != nil {
 			return err
 		}

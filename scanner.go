@@ -2,6 +2,7 @@ package hubsync
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"sort"
@@ -14,11 +15,12 @@ import (
 type Scanner struct {
 	dir     string
 	ignorer lstree.Ignorer
+	hasher  Hasher
 }
 
-// NewScanner creates a Scanner.
-func NewScanner(dir string, ignorer lstree.Ignorer) *Scanner {
-	return &Scanner{dir: dir, ignorer: ignorer}
+// NewScanner creates a Scanner from a ScannerConfig.
+func NewScanner(cfg ScannerConfig) *Scanner {
+	return &Scanner{dir: cfg.WatchDir, ignorer: cfg.Ignorer, hasher: cfg.Hasher}
 }
 
 // FileInfo holds stat + digest for a scanned file.
@@ -47,30 +49,27 @@ func (s *Scanner) ScanAll(currentTree map[string]TreeEntry) (map[string]FileInfo
 			Path:  e.Path,
 			Size:  e.Size,
 			MTime: e.ModTime.Unix(),
-			Mode:  0644, // default
+			Mode:  0644,
 		}
 
-		// Try stat for mode
 		fullPath := s.dir + "/" + e.Path
 		if st, err := os.Lstat(fullPath); err == nil {
 			info.Mode = uint32(st.Mode().Perm())
 		}
 
-		// Digest cache: reuse if mtime+size match
 		if existing, ok := currentTree[e.Path]; ok {
-			if existing.MTime == info.MTime && existing.Size == info.Size {
+			if existing.MTime == info.MTime && existing.Size == info.Size && !existing.Digest.IsZero() {
 				info.Digest = existing.Digest
 				result[e.Path] = info
 				return nil
 			}
 		}
 
-		// Read and hash
-		data, err := fs.ReadFile(fsys, e.Path)
+		d, err := s.hashFile(fsys, e.Path)
 		if err != nil {
-			return fmt.Errorf("read %s: %w", e.Path, err)
+			return fmt.Errorf("hash %s: %w", e.Path, err)
 		}
-		info.Digest = ComputeDigest(data)
+		info.Digest = d
 		result[e.Path] = info
 		return nil
 	})
@@ -80,12 +79,24 @@ func (s *Scanner) ScanAll(currentTree map[string]TreeEntry) (map[string]FileInfo
 	return result, nil
 }
 
+func (s *Scanner) hashFile(fsys fs.FS, path string) (Digest, error) {
+	f, err := fsys.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := s.hasher.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return Digest(h.Sum(nil)), nil
+}
+
 // Diff compares a scan result against the current tree and returns change entries.
 // Creates/updates come before deletes (as required by the spec for move dedup).
 func (s *Scanner) Diff(scanned map[string]FileInfo, currentTree map[string]TreeEntry) []ChangeEntry {
 	var creates, deletes []ChangeEntry
 
-	// Detect creates and updates
 	for path, info := range scanned {
 		existing, exists := currentTree[path]
 		if !exists {
@@ -111,7 +122,6 @@ func (s *Scanner) Diff(scanned map[string]FileInfo, currentTree map[string]TreeE
 		}
 	}
 
-	// Detect deletes
 	for path := range currentTree {
 		if _, exists := scanned[path]; !exists {
 			deletes = append(deletes, ChangeEntry{
@@ -123,11 +133,9 @@ func (s *Scanner) Diff(scanned map[string]FileInfo, currentTree map[string]TreeE
 		}
 	}
 
-	// Sort for deterministic output
 	sort.Slice(creates, func(i, j int) bool { return creates[i].Path < creates[j].Path })
 	sort.Slice(deletes, func(i, j int) bool { return deletes[i].Path < deletes[j].Path })
 
-	// Creates before deletes (spec requirement for move dedup)
 	return append(creates, deletes...)
 }
 
@@ -141,7 +149,6 @@ func ProvideIgnorer(dir string) (lstree.Ignorer, error) {
 	return &hubsyncIgnorer{base: base}, nil
 }
 
-// hubsyncIgnorer wraps an Ignorer to always exclude .hubsync/.
 type hubsyncIgnorer struct {
 	base lstree.Ignorer
 }

@@ -54,7 +54,7 @@ func (h *Hub) pushCreate(op *PushOp, policy ConflictPolicy) *PushResult {
 		Outcome: &PushResult_Conflict{Conflict: &PushConflict{
 			Reason:         "file already exists",
 			CurrentVersion: uint64(h.versionForEntry(existing)),
-			CurrentDigest:  existing.Digest[:],
+			CurrentDigest:  existing.Digest.Bytes(),
 		}},
 	}
 }
@@ -88,7 +88,7 @@ func (h *Hub) pushUpdate(op *PushOp, policy ConflictPolicy) *PushResult {
 			Outcome: &PushResult_Conflict{Conflict: &PushConflict{
 				Reason:         "version conflict (hub wins — change dropped)",
 				CurrentVersion: uint64(currentVersion),
-				CurrentDigest:  existing.Digest[:],
+				CurrentDigest:  existing.Digest.Bytes(),
 			}},
 		}
 	}
@@ -99,7 +99,7 @@ func (h *Hub) pushUpdate(op *PushOp, policy ConflictPolicy) *PushResult {
 		Outcome: &PushResult_Conflict{Conflict: &PushConflict{
 			Reason:         "version conflict",
 			CurrentVersion: uint64(currentVersion),
-			CurrentDigest:  existing.Digest[:],
+			CurrentDigest:  existing.Digest.Bytes(),
 		}},
 	}
 }
@@ -122,7 +122,7 @@ func (h *Hub) pushDelete(op *PushOp, policy ConflictPolicy) *PushResult {
 			Outcome: &PushResult_Conflict{Conflict: &PushConflict{
 				Reason:         "version conflict on delete",
 				CurrentVersion: uint64(currentVersion),
-				CurrentDigest:  existing.Digest[:],
+				CurrentDigest:  existing.Digest.Bytes(),
 			}},
 		}
 	}
@@ -178,7 +178,7 @@ func (h *Hub) acceptWrite(op *PushOp, changeOp ChangeOp) *PushResult {
 		}
 	}
 
-	digest := ComputeDigest(op.Data)
+	digest := h.Hasher.Sum(op.Data)
 	now := time.Now().Unix()
 
 	entry := ChangeEntry{

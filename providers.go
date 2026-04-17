@@ -17,69 +17,64 @@ type ClientApp struct {
 	Client *Client
 }
 
-// HubProviderSet provides all hub-side dependencies.
+// HubProviderSet wires all hub-side dependencies. Each per-type dependency has
+// a TypeNameConfig assembled from the root *HubConfig; constructors take only
+// that config plus peer-type deps. See docs/wire.md (skills/golang/wire.md).
 var HubProviderSet = wire.NewSet(
-	ProvideHubStore,
-	ProvideScanner,
-	ProvideWatcher,
+	ProvideHubHasher,
+	ProvideHubStoreConfig, NewHubStore,
+	ProvideScannerConfig, NewScanner,
+	ProvideWatcherConfig, NewWatcher,
+	ProvideServerConfig, NewServer,
 	NewBroadcaster,
 	NewHub,
-	ProvideServer,
 	wire.Struct(new(HubApp), "*"),
 )
 
-// ClientProviderSet provides all client-side dependencies.
+// ClientProviderSet wires all client-side dependencies.
 var ClientProviderSet = wire.NewSet(
-	ProvideClientStore,
+	ProvideClientStoreConfig, OpenClientStore,
 	ProvideClient,
 	wire.Struct(new(ClientApp), "*"),
 )
 
-// ProvideHubStore opens the hub DB and creates a HubStore.
-func ProvideHubStore(cfg *HubConfig) (*HubStore, func(), error) {
-	db, err := OpenDB(cfg.DBPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	store, err := NewHubStore(db)
-	if err != nil {
-		db.Close()
-		return nil, nil, err
-	}
-	return store, func() { db.Close() }, nil
-}
-
-// ProvideScanner creates a Scanner from HubConfig.
-func ProvideScanner(cfg *HubConfig) (*Scanner, error) {
-	ignorer, err := ProvideIgnorer(cfg.WatchDir)
+// ProvideHubHasher resolves the hub's configured hash algorithm and returns a
+// Hasher used throughout the hub stack.
+func ProvideHubHasher(cfg *HubConfig) (Hasher, error) {
+	algo, err := cfg.ResolveHashAlgo()
 	if err != nil {
 		return nil, err
 	}
-	return NewScanner(cfg.WatchDir, ignorer), nil
+	return NewHasher(algo)
 }
 
-// ProvideWatcher creates a Watcher from HubConfig.
-func ProvideWatcher(cfg *HubConfig) (*Watcher, func(), error) {
-	return NewWatcher(cfg.WatchDir)
+// ProvideHubStoreConfig assembles HubStoreConfig from the root HubConfig + Hasher.
+func ProvideHubStoreConfig(cfg *HubConfig, h Hasher) HubStoreConfig {
+	return HubStoreConfig{DBPath: cfg.DBPath, Hasher: h}
 }
 
-// ProvideServer creates a Server from HubConfig.
-func ProvideServer(hub *Hub, cfg *HubConfig) *Server {
-	return NewServer(hub, BearerToken(cfg.Token), cfg.Listen)
-}
-
-// ProvideClientStore opens the client DB and creates a ClientStore.
-func ProvideClientStore(cfg *ClientConfig) (*ClientStore, func(), error) {
-	db, err := OpenDB(cfg.DBPath)
+// ProvideScannerConfig assembles ScannerConfig (includes resolving an Ignorer).
+func ProvideScannerConfig(cfg *HubConfig, h Hasher) (ScannerConfig, error) {
+	ig, err := ProvideIgnorer(cfg.WatchDir)
 	if err != nil {
-		return nil, nil, err
+		return ScannerConfig{}, err
 	}
-	store, err := NewClientStore(db)
-	if err != nil {
-		db.Close()
-		return nil, nil, err
-	}
-	return store, func() { db.Close() }, nil
+	return ScannerConfig{WatchDir: cfg.WatchDir, Ignorer: ig, Hasher: h}, nil
+}
+
+// ProvideWatcherConfig assembles WatcherConfig from the root HubConfig.
+func ProvideWatcherConfig(cfg *HubConfig) WatcherConfig {
+	return WatcherConfig{WatchDir: cfg.WatchDir}
+}
+
+// ProvideServerConfig assembles ServerConfig from the root HubConfig + Hasher.
+func ProvideServerConfig(cfg *HubConfig, h Hasher) ServerConfig {
+	return ServerConfig{Listen: cfg.Listen, Token: BearerToken(cfg.Token), Hasher: h}
+}
+
+// ProvideClientStoreConfig assembles ClientStoreConfig from the root ClientConfig.
+func ProvideClientStoreConfig(cfg *ClientConfig) ClientStoreConfig {
+	return ClientStoreConfig{DBPath: cfg.DBPath}
 }
 
 // ProvideClient creates a Client from ClientConfig.

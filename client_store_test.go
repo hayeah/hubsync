@@ -139,7 +139,7 @@ func TestClientStoreApplyChange(t *testing.T) {
 	}
 
 	// Apply delete
-	err = store.ApplyChange(2, "file.txt", OpDelete, FileKindFile, Digest{}, 0, 0, 0)
+	err = store.ApplyChange(2, "file.txt", OpDelete, FileKindFile, "", 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

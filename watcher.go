@@ -15,16 +15,16 @@ type Watcher struct {
 }
 
 // NewWatcher creates a Watcher for the given directory.
-func NewWatcher(dir string) (*Watcher, func(), error) {
+func NewWatcher(cfg WatcherConfig) (*Watcher, func(), error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := w.Add(dir); err != nil {
+	if err := w.Add(cfg.WatchDir); err != nil {
 		w.Close()
 		return nil, nil, err
 	}
-	watcher := &Watcher{dir: dir, watcher: w}
+	watcher := &Watcher{dir: cfg.WatchDir, watcher: w}
 	cleanup := func() { w.Close() }
 	return watcher, cleanup, nil
 }

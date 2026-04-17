@@ -15,14 +15,21 @@ import (
 // Server serves the hub's HTTP API.
 type Server struct {
 	Hub    *Hub
+	hasher Hasher
 	token  BearerToken
 	listen string
 	mux    *http.ServeMux
 }
 
 // NewServer creates a Server and sets up routes.
-func NewServer(hub *Hub, token BearerToken, listen string) *Server {
-	s := &Server{Hub: hub, token: token, listen: listen, mux: http.NewServeMux()}
+func NewServer(hub *Hub, cfg ServerConfig) *Server {
+	s := &Server{
+		Hub:    hub,
+		hasher: cfg.Hasher,
+		token:  cfg.Token,
+		listen: cfg.Listen,
+		mux:    http.NewServeMux(),
+	}
 	s.routes()
 	return s
 }
@@ -125,7 +132,7 @@ func (s *Server) writeEvent(w io.Writer, e ChangeEntry) error {
 	} else {
 		change := &FileChange{
 			Kind:   EntryKind(e.Kind),
-			Digest: e.Digest[:],
+			Digest: e.Digest.Bytes(),
 			Size:   uint64(e.Size),
 			Mode:   e.Mode,
 			Mtime:  e.MTime,
@@ -191,7 +198,7 @@ func (s *Server) handleSnapshotTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbData, err := generateClientDB(s.Hub.Store, version)
+	dbData, err := generateClientDB(s.Hub.Store, version, s.hasher.Name())
 	if err != nil {
 		http.Error(w, "generate db", http.StatusInternalServerError)
 		return
@@ -243,8 +250,8 @@ func (s *Server) handleDelta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetDigest, err := ParseDigest(fmt.Sprintf("%x", req.TargetDigest))
-	if err != nil {
+	targetDigest := Digest(req.TargetDigest)
+	if targetDigest.IsZero() {
 		http.Error(w, "invalid target digest", http.StatusBadRequest)
 		return
 	}

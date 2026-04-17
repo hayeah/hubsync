@@ -13,23 +13,31 @@ import (
 // Injectors from wire.go:
 
 func InitializeHubApp(cfg *hubsync.HubConfig) (*hubsync.HubApp, func(), error) {
-	hubStore, cleanup, err := hubsync.ProvideHubStore(cfg)
+	hasher, err := hubsync.ProvideHubHasher(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	scanner, err := hubsync.ProvideScanner(cfg)
+	hubStoreConfig := hubsync.ProvideHubStoreConfig(cfg, hasher)
+	hubStore, cleanup, err := hubsync.NewHubStore(hubStoreConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	scannerConfig, err := hubsync.ProvideScannerConfig(cfg, hasher)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	watcher, cleanup2, err := hubsync.ProvideWatcher(cfg)
+	scanner := hubsync.NewScanner(scannerConfig)
+	watcherConfig := hubsync.ProvideWatcherConfig(cfg)
+	watcher, cleanup2, err := hubsync.NewWatcher(watcherConfig)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 	broadcaster := hubsync.NewBroadcaster()
-	hub := hubsync.NewHub(hubStore, scanner, watcher, broadcaster)
-	server := hubsync.ProvideServer(hub, cfg)
+	hub := hubsync.NewHub(hubStore, scanner, watcher, broadcaster, hasher)
+	serverConfig := hubsync.ProvideServerConfig(cfg, hasher)
+	server := hubsync.NewServer(hub, serverConfig)
 	hubApp := &hubsync.HubApp{
 		Server: server,
 		Hub:    hub,
@@ -41,7 +49,8 @@ func InitializeHubApp(cfg *hubsync.HubConfig) (*hubsync.HubApp, func(), error) {
 }
 
 func InitializeClientApp(cfg *hubsync.ClientConfig) (*hubsync.ClientApp, func(), error) {
-	clientStore, cleanup, err := hubsync.ProvideClientStore(cfg)
+	clientStoreConfig := hubsync.ProvideClientStoreConfig(cfg)
+	clientStore, cleanup, err := hubsync.OpenClientStore(clientStoreConfig)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -64,7 +64,7 @@ func (c *Client) ScanLocal() ([]LocalChange, []LocalDeletion, error) {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", e.Path, err)
 		}
-		localDigest := ComputeDigest(data)
+		localDigest := c.hasher.Sum(data)
 
 		// If digest matches, in sync despite stat change
 		if exists && localDigest == hubEntry.Digest {
@@ -108,7 +108,7 @@ func BuildPushOps(changes []LocalChange, deletions []LocalDeletion) []*PushOp {
 	for _, c := range changes {
 		op := &PushOp{
 			Path:   c.Path,
-			Digest: c.Digest[:],
+			Digest: c.Digest.Bytes(),
 			Data:   c.Data,
 		}
 		if c.HubEntry == nil {
@@ -234,7 +234,7 @@ func (c *Client) updateHubTreeAfterPush(path string, version int64, changes []Lo
 	}
 	for _, d := range deletions {
 		if d.Path == path {
-			return c.Store.ApplyChange(version, path, OpDelete, FileKindFile, Digest{}, 0, 0, 0)
+			return c.Store.ApplyChange(version, path, OpDelete, FileKindFile, "", 0, 0, 0)
 		}
 	}
 	return nil
@@ -256,11 +256,8 @@ func (c *Client) handleConflict(path string, conflict *PushConflict) {
 
 	// Fetch hub's current blob and write to original path
 	if len(conflict.CurrentDigest) > 0 {
-		digest, err := ParseDigest(fmt.Sprintf("%x", conflict.CurrentDigest))
-		if err == nil {
-			if err := c.fetchFullBlob(digest, fullPath, 0644); err != nil {
-				log.Printf("conflict %s: failed to fetch hub version: %v", path, err)
-			}
+		if err := c.fetchFullBlob(Digest(conflict.CurrentDigest), fullPath, 0644); err != nil {
+			log.Printf("conflict %s: failed to fetch hub version: %v", path, err)
 		}
 	}
 }

@@ -4,8 +4,9 @@ import (
 	"os"
 )
 
-// generateClientDB creates an in-memory SQLite DB with hub_tree and sync_state.
-func generateClientDB(store *HubStore, version int64) ([]byte, error) {
+// generateClientDB creates a SQLite DB with hub_tree and sync_state (populated
+// with hub_version + hash_algo) for /snapshots-tree/{version} responses.
+func generateClientDB(store *HubStore, version int64, hashAlgo string) ([]byte, error) {
 	tmpFile, err := os.CreateTemp("", "hubsync-snapshot-*.db")
 	if err != nil {
 		return nil, err
@@ -36,10 +37,14 @@ func generateClientDB(store *HubStore, version int64) ([]byte, error) {
 		db.Close()
 		return nil, err
 	}
+	if hashAlgo != "" {
+		if err := clientStore.SetHashAlgo(hashAlgo); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 
 	db.Close()
-
-	// Force WAL checkpoint and read
 	return readAndCheckpoint(tmpPath)
 }
 

@@ -12,28 +12,28 @@ type Hub struct {
 	Scanner     *Scanner
 	Watcher     *Watcher
 	Broadcaster *Broadcaster
+	Hasher      Hasher
 }
 
 // NewHub creates a Hub.
-func NewHub(store *HubStore, scanner *Scanner, watcher *Watcher, bc *Broadcaster) *Hub {
+func NewHub(store *HubStore, scanner *Scanner, watcher *Watcher, bc *Broadcaster, hasher Hasher) *Hub {
 	return &Hub{
 		Store:       store,
 		Scanner:     scanner,
 		Watcher:     watcher,
 		Broadcaster: bc,
+		Hasher:      hasher,
 	}
 }
 
 // Start performs an initial full scan and then starts the watcher loop.
 // It blocks until ctx is cancelled.
 func (h *Hub) Start(ctx context.Context) error {
-	// Initial full scan
 	if err := h.FullScan(); err != nil {
 		return fmt.Errorf("initial scan: %w", err)
 	}
 	log.Printf("initial scan complete, version=%d", h.mustLatestVersion())
 
-	// Start watcher loop
 	if h.Watcher != nil {
 		return h.Watcher.Run(ctx, func(paths []string) {
 			if err := h.FullScan(); err != nil {
@@ -42,7 +42,6 @@ func (h *Hub) Start(ctx context.Context) error {
 		})
 	}
 
-	// No watcher — just block
 	<-ctx.Done()
 	return ctx.Err()
 }
