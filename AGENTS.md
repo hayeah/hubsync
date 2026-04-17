@@ -91,6 +91,40 @@ Success criteria:
 - `/blobs/{digest}` on an unpinned file returns `302 Found` with a `Location:` pointing at a `Authorization=…` presigned B2 URL.
 - Pin restores the exact bytes and flips the row back to `a`.
 
+### One-shot archive (no serve)
+
+`hubsync archive` is the no-daemon variant for "back up this tree to B2 and leave". Same config layout; run it instead of `serve`:
+
+```bash
+SMOKE=/tmp/hs-archive-smoke-$$
+mkdir -p $SMOKE/.hubsync
+cat > $SMOKE/.hubsync/config.toml <<EOF
+[hub]
+hash = "xxh128"
+
+[archive]
+provider      = "b2"
+bucket        = "hayeah-hubsync-test"
+bucket_prefix = "hubsync-archive-smoke/$$/"
+EOF
+dd if=/dev/urandom of=$SMOKE/small.bin bs=1k count=8
+dd if=/dev/urandom of=$SMOKE/big.bin   bs=1M count=4
+
+# Preview — no network, no creds needed
+/tmp/hubsync archive --dry $SMOKE
+
+# Real run — takes hub.lock for the duration
+godotenv -f ~/.env.secret /tmp/hubsync archive $SMOKE
+
+# Verify — ls / status work without serve (DB read-only fallback)
+/tmp/hubsync status -dir $SMOKE
+/tmp/hubsync ls     -dir $SMOKE | duckql "WHERE state='archived' SELECT count(*)"
+
+rm -rf $SMOKE
+```
+
+Success criteria: `archive --dry` prints one JSONL row per file with `"state":""`; real `archive` prints per-file progress on stderr + a summary; re-running `archive` is a no-op (rows are already `archived`); `ls` works without any `serve` running.
+
 ## Credentials & secrets
 
 - **Never read `~/.env.secret` from code or from an agent directly.** Use `godotenv` to overlay it onto a subcommand's env.

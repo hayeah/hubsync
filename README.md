@@ -65,15 +65,25 @@ If you'd rather not use env vars, just edit `.hubsync/config.toml` and hard-code
 
 When the config is present, `hubsync serve` starts an archive worker that uploads every file under the hub directory to `<bucket>/<bucket_prefix>`. Each upload stamps `X-Bz-Info-hubsync_digest` + `X-Bz-Info-hubsync_digest_algo` so an operator (or a future `fsck`) can cross-check content.
 
-Operator verbs all talk to a running `hubsync serve` over `.hubsync/serve.sock`:
+Operator verbs work with **or without** a running `hubsync serve`:
 
 ```bash
-hubsync ls                              # virtual listing incl. unpinned entries
-hubsync status                          # tree + archive counts
-hubsync pin   'big.bin'                 # ensure the file is archived + local
-hubsync unpin 'big.bin'                 # ensure it's archived, then evict local
-hubsync unpin '**/*.tmp'  --dry         # show the plan, mutate nothing
+hubsync archive /path/to/dir              # one-shot: scan + upload pending files, then exit
+hubsync archive /path/to/dir --dry        # preview as JSONL; no network, no state change
+hubsync ls                                # virtual listing incl. unpinned entries
+hubsync status                            # tree + archive counts
+hubsync pin   'big.bin'                   # ensure the file is archived + local
+hubsync unpin 'big.bin'                   # ensure it's archived, then evict local
+hubsync unpin '**/*.tmp'  --dry           # show the plan, mutate nothing
 ```
+
+If `hubsync serve` is listening on `.hubsync/serve.sock`, these verbs RPC
+to it. If it isn't, they run in-process: take an exclusive flock on
+`.hubsync/hub.lock` (so two writers can't race), scan the tree, apply the
+operation, release the lock. `ls` and `status` are read-only and skip the
+lock entirely — they open the DB read-only via SQLite WAL. This makes
+`hubsync archive` usable as a general "back up this tree to B2 and leave"
+tool with no daemon required.
 
 **Pin state is a data-fetch concern, not a tree-visibility concern.** Clients still see unpinned rows in `hub_tree`; `GET /blobs/{digest}` on a hub whose local copy is gone transparently returns a 302 to a short-lived presigned B2 URL.
 
@@ -112,6 +122,31 @@ Start a sync client.
 | `-scan-interval` | `5s` | How often to scan for local changes (write mode) |
 | `-once` | `false` | Bootstrap and/or catch up to the hub's current state, then exit (read mode only) |
 
+### `hubsync archive`
+
+One-shot: walks a hub directory and uploads every pending file to B2, then exits. Complementary to `hubsync serve` — use when you want to back up a static tree (e.g. a build output) without running a daemon.
+
+```
+hubsync archive [dir] [--dry] [--quiet]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| positional `dir` | `.` | Hub directory (walks up looking for `.hubsync/`) |
+| `--dry` | `false` | Emit JSONL of what would upload; no network, no state change, no B2 credentials required |
+| `--quiet` | `false` | Suppress per-file progress on stderr |
+
+Takes `.hubsync/hub.lock` for the duration, so concurrent runs against the same hub fail fast with a clear error. Exit codes: `0` = all uploaded (or nothing to do, or `--dry` succeeded); `1` = at least one upload failed (others still attempted); `2` = startup failure (no `.hubsync`, missing `[archive]`, lock held, etc.).
+
+```bash
+# Typical usage in a build pipeline
+hubsync init ./dist
+godotenv -f ~/.env.secret hubsync archive ./dist
+
+# Preview before running the real thing
+hubsync archive ./dist --dry | duckql "SELECT state, count(*) GROUP BY 1"
+```
+
 ### `hubsync pin` / `hubsync unpin`
 
 Declarative commands; the argument is a doublestar glob, the command is the target state.
@@ -121,17 +156,24 @@ Declarative commands; the argument is a doublestar glob, the command is the targ
 | `-dir` | `.` | Hub directory (walks up looking for `.hubsync/`) |
 | `--dry` | `false` | Print the reconciler plan per path; do not mutate |
 
-Both require a running `hubsync serve` in the same hub. `--dry` must precede the glob (Go's `flag` package stops at the first positional).
+If `hubsync serve` is running, the verbs RPC to it. Otherwise they run in-process after taking `.hubsync/hub.lock`. Either way `[archive]` must be configured (pin/unpin need the B2 client). `--dry` must precede the glob (Go's `flag` package stops at the first positional).
 
 ### `hubsync ls`
 
-Virtual listing from the hub's registry (including unpinned rows). Output is JSONL — one object per line — so it pipes directly into `duckql`, `jq`, or any SQL / filter tool.
+Virtual listing from the hub's registry (including unpinned rows). Follows the shared [`ls` / `duckql` convention](https://github.com/hayeah/dotfiles) — no bespoke filter flags; pipe to `duckql` when you want to filter, sort, or aggregate.
+
+```
+hubsync ls [--quiet]
+```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-dir` | `.` | Hub directory |
+| `--quiet` | `false` | Suppress warnings on stderr (no-op today — convention placeholder) |
 
-Row fields:
+**TTY auto-detection**: on a terminal, `ls` renders a human-readable `tabwriter` table; when piped, it emits JSONL — one object per line.
+
+Row fields (JSONL):
 
 | field | meaning |
 |---|---|
@@ -139,9 +181,11 @@ Row fields:
 | `kind` | `file`, `directory`, or `symlink` |
 | `state` | archive state: `archived`, `unpinned`, `dirty`, or `""` (pre-archive / NULL) |
 | `size` | bytes |
-| `mtime` | unix seconds |
-| `digest_hex` | content digest hex (blake3) |
+| `mtime` | RFC3339 UTC timestamp (e.g. `"2026-04-17T13:42:05Z"`) |
+| `digest_hex` | content digest hex (xxh128 or sha256, per `[hub].hash`) |
 | `archive_file_id` | B2 fileId (only for archived rows) |
+
+`hubsync archive --dry` emits the **same** row shape, so any query that works for `ls` works for the dry-run preview.
 
 Examples (assumes `duckql` on `$PATH`):
 
@@ -154,6 +198,9 @@ hubsync ls | duckql "SELECT state, count(*) AS n GROUP BY 1 ORDER BY n DESC"
 
 # Paths over 1 MB, sorted desc
 hubsync ls | duckql "SELECT path, size WHERE kind='file' AND size > 1000000 ORDER BY size DESC"
+
+# Preview an archive run
+hubsync archive --dry | duckql "SELECT path, size ORDER BY size DESC LIMIT 10"
 ```
 
 ### `hubsync status`
