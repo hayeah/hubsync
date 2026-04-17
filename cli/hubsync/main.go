@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -29,6 +30,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "client":
 		cmdClient(os.Args[2:])
+	case "archive":
+		cmdArchive(os.Args[2:])
 	case "pin":
 		cmdPin(os.Args[2:], hubsync.TargetArchived)
 	case "unpin":
@@ -48,16 +51,18 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `hubsync — hub-and-client file sync with B2 archive
 
 Usage:
-  hubsync init     [dir]                 Scaffold .hubsync/config.toml under dir (default: .).
-  hubsync serve    [flags]               Run the hub (scanner + watcher + archive + RPC).
-  hubsync client   [flags]               Run a replica (read or write mode).
-  hubsync pin      <glob>... [--dry]     Ensure matched paths are archived (remote + local).
-  hubsync unpin    <glob>... [--dry]     Ensure matched paths are unpinned (remote only).
-  hubsync ls       [glob] [--long]       List every tree entry with archive state.
-  hubsync status   [--json]              Tree + archive counts.
+  hubsync init     [dir]                      Scaffold .hubsync/config.toml under dir (default: .).
+  hubsync serve    [flags]                    Run the hub (scanner + watcher + archive + RPC).
+  hubsync client   [flags]                    Run a replica (read or write mode).
+  hubsync archive  [dir] [--dry] [--quiet]    One-shot: scan + upload pending files to B2, then exit.
+  hubsync pin      <glob>... [--dry]          Ensure matched paths are archived (remote + local).
+  hubsync unpin    <glob>... [--dry]          Ensure matched paths are unpinned (remote only).
+  hubsync ls       [--quiet]                  List every tree entry (JSONL when piped, table on TTY).
+  hubsync status   [--json]                   Tree + archive counts.
 
-All verbs besides 'init' / 'serve' / 'client' talk to a running 'hubsync serve'
-over .hubsync/serve.sock.
+'archive', 'pin', 'unpin', 'ls', 'status' work with or without a running
+'hubsync serve': if serve is up, they RPC to .hubsync/serve.sock; otherwise
+they run in-process after taking an exclusive flock on .hubsync/hub.lock.
 `)
 }
 
@@ -254,21 +259,54 @@ func cmdPin(args []string, target hubsync.TargetState) {
 		log.Fatal(err)
 	}
 
-	c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))
 	req := hubsync.PinRequest{Globs: fs.Args(), Dry: *dry}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	var resp *hubsync.PinResponse
-	if target == hubsync.TargetArchived {
-		resp, err = c.Pin(ctx, req)
-	} else {
-		resp, err = c.Unpin(ctx, req)
-	}
+	resp, err := runPinOrUnpin(ctx, hubDir, req, target)
 	if err != nil {
 		log.Fatalf("%s: %v", verb, err)
 	}
+	failures := printPinResults(verb, resp)
+	if failures > 0 {
+		os.Exit(1)
+	}
+}
+
+// runPinOrUnpin takes the try-lock-then-RPC fork in the road:
+//   - acquired → run in-process (scan first so new files are tracked).
+//   - lock held + serve.sock reachable → RPC.
+//   - lock held + no serve → clear error.
+func runPinOrUnpin(ctx context.Context, hubDir string, req hubsync.PinRequest, target hubsync.TargetState) (*hubsync.PinResponse, error) {
+	stack, release, err := acquireOneShot(hubDir, true)
+	if err == nil {
+		defer release()
+		if scanErr := stack.hub.FullScan(); scanErr != nil {
+			return nil, fmt.Errorf("scan: %w", scanErr)
+		}
+		resp, rerr := hubsync.RunReconcile(ctx, stack.reconciler, stack.store, req, target)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return &resp, nil
+	}
+	if !errors.Is(err, hubsync.ErrLocked) {
+		// Wiring failure (missing [archive], bad config, DB open error) —
+		// don't mask it by falling through to RPC.
+		return nil, err
+	}
+	// Lock held. Try RPC.
+	if !rpcReachable(hubDir) {
+		return nil, lockHeldMessage(hubDir, nil)
+	}
+	c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))
+	if target == hubsync.TargetArchived {
+		return c.Pin(ctx, req)
+	}
+	return c.Unpin(ctx, req)
+}
+
+func printPinResults(verb string, resp *hubsync.PinResponse) int {
 	failures := 0
 	for _, r := range resp.Results {
 		steps := strings.Join(r.Steps, " → ")
@@ -283,9 +321,7 @@ func cmdPin(args []string, target hubsync.TargetState) {
 			fmt.Printf("%s %s [%s]: %s\n", prefix, r.Path, r.StartingState, steps)
 		}
 	}
-	if failures > 0 {
-		os.Exit(1)
-	}
+	return failures
 }
 
 // --- ls ------------------------------------------------------------------
