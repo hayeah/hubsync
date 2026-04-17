@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/hayeah/hubsync"
@@ -256,7 +255,6 @@ func cmdPin(args []string, target hubsync.TargetState) {
 
 func cmdLs(args []string) {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	long := fs.Bool("long", false, "show B2 fileId prefix")
 	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
 	fs.Parse(args)
 
@@ -278,32 +276,11 @@ func cmdLs(args []string) {
 		log.Fatalf("ls: %v", err)
 	}
 
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	enc := json.NewEncoder(os.Stdout)
 	for _, e := range resp.Entries {
-		flag := archiveStateFlag(e.ArchiveState)
-		if *long {
-			fid := e.ArchiveFileID
-			if len(fid) > 12 {
-				fid = fid[:12] + "…"
-			}
-			fmt.Fprintf(tw, "%s\t%10d\t%s\t%s\n", flag, e.Size, fid, e.Path)
-		} else {
-			fmt.Fprintf(tw, "%s\t%s\n", flag, e.Path)
+		if err := enc.Encode(e); err != nil {
+			log.Fatalf("ls encode: %v", err)
 		}
-	}
-	tw.Flush()
-}
-
-func archiveStateFlag(s string) string {
-	switch s {
-	case "archived":
-		return "a"
-	case "unpinned":
-		return "u"
-	case "dirty":
-		return "d"
-	default:
-		return "-"
 	}
 }
 

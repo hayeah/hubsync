@@ -97,14 +97,36 @@ Both require a running `hubsync serve` in the same hub. `--dry` must precede the
 
 ### `hubsync ls`
 
-Virtual listing from the hub's registry (including unpinned rows).
+Virtual listing from the hub's registry (including unpinned rows). Output is JSONL — one object per line — so it pipes directly into `duckql`, `jq`, or any SQL / filter tool.
 
 | Flag | Default | Description |
 |---|---|---|
 | `-dir` | `.` | Hub directory |
-| `--long` | `false` | Include size + B2 fileId prefix |
 
-State flag per row: `a` archived, `u` unpinned, `d` dirty, `-` pre-archive (NULL).
+Row fields:
+
+| field | meaning |
+|---|---|
+| `path` | path relative to the hub root |
+| `kind` | `file`, `directory`, or `symlink` |
+| `state` | archive state: `archived`, `unpinned`, `dirty`, or `""` (pre-archive / NULL) |
+| `size` | bytes |
+| `mtime` | unix seconds |
+| `digest_hex` | content digest hex (blake3) |
+| `archive_file_id` | B2 fileId (only for archived rows) |
+
+Examples (assumes `duckql` on `$PATH`):
+
+```bash
+# Filter by state
+hubsync ls | duckql "WHERE state='unpinned'"
+
+# Aggregate
+hubsync ls | duckql "SELECT state, count(*) AS n GROUP BY 1 ORDER BY n DESC"
+
+# Paths over 1 MB, sorted desc
+hubsync ls | duckql "SELECT path, size WHERE kind='file' AND size > 1000000 ORDER BY size DESC"
+```
 
 ### `hubsync status`
 
