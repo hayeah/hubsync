@@ -23,6 +23,8 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "init":
+		cmdInit(os.Args[2:])
 	case "serve":
 		cmdServe(os.Args[2:])
 	case "client":
@@ -46,6 +48,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `hubsync — hub-and-client file sync with B2 archive
 
 Usage:
+  hubsync init     [dir]                 Scaffold .hubsync/config.toml under dir (default: .).
   hubsync serve    [flags]               Run the hub (scanner + watcher + archive + RPC).
   hubsync client   [flags]               Run a replica (read or write mode).
   hubsync pin      <glob>... [--dry]     Ensure matched paths are archived (remote + local).
@@ -53,9 +56,35 @@ Usage:
   hubsync ls       [glob] [--long]       List every tree entry with archive state.
   hubsync status   [--json]              Tree + archive counts.
 
-All verbs besides 'serve' / 'client' talk to a running 'hubsync serve' over
-.hubsync/serve.sock.
+All verbs besides 'init' / 'serve' / 'client' talk to a running 'hubsync serve'
+over .hubsync/serve.sock.
 `)
+}
+
+// --- init ----------------------------------------------------------------
+
+func cmdInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: hubsync init [dir]\n\nScaffold .hubsync/config.toml under dir (default: current directory).\nRefuses to overwrite an existing config; remove it by hand to re-init.\n")
+	}
+	fs.Parse(args)
+
+	dir := "."
+	switch fs.NArg() {
+	case 0:
+	case 1:
+		dir = fs.Arg(0)
+	default:
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	path, err := runInit(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("wrote %s\n", path)
 }
 
 // --- serve ---------------------------------------------------------------
