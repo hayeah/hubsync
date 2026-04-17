@@ -3,8 +3,12 @@ package hubsync
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -159,6 +163,128 @@ func TestArchiveWorkerSkipsAlreadyArchived(t *testing.T) {
 	got, _, _ := env.store.EntryLookup("done.txt")
 	if got.ArchiveFileID != "pre-fileId" {
 		t.Errorf("fileId got overwritten: %q", got.ArchiveFileID)
+	}
+}
+
+func TestArchiveWorkerRunOnce_Drains(t *testing.T) {
+	env := newWorkerEnv(t)
+	env.stampLocalAndEntry(t, "a.txt", "alpha")
+	env.stampLocalAndEntry(t, "dir/b.txt", "beta")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result, err := env.worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(result.Uploaded) != 2 {
+		t.Errorf("Uploaded=%d want 2", len(result.Uploaded))
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("Failed=%v want 0", result.Failed)
+	}
+	if got, _ := env.storage.Bytes("backups/test/a.txt"); string(got) != "alpha" {
+		t.Errorf("remote a.txt = %q", got)
+	}
+	if got, _ := env.storage.Bytes("backups/test/dir/b.txt"); string(got) != "beta" {
+		t.Errorf("remote dir/b.txt = %q", got)
+	}
+
+	// Second RunOnce should be a no-op — all rows are already archived.
+	result2, err := env.worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatalf("RunOnce #2: %v", err)
+	}
+	if len(result2.Uploaded) != 0 || len(result2.Failed) != 0 {
+		t.Errorf("second pass not idempotent: %+v", result2)
+	}
+}
+
+func TestArchiveWorkerRunOnce_EmptyTree(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	result, err := env.worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(result.Uploaded)+len(result.Failed) != 0 {
+		t.Errorf("empty tree produced work: %+v", result)
+	}
+}
+
+func TestArchiveWorkerRunOnce_Progress(t *testing.T) {
+	env := newWorkerEnv(t)
+	env.stampLocalAndEntry(t, "a.txt", "alpha")
+	env.stampLocalAndEntry(t, "b.txt", "beta")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	var seen []string
+	result, err := env.worker.RunOnce(ctx, func(u ArchiveUpload, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			seen = append(seen, u.Path+":fail")
+			return
+		}
+		seen = append(seen, u.Path)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Uploaded) != 2 {
+		t.Errorf("uploaded=%d", len(result.Uploaded))
+	}
+	if len(seen) != 2 {
+		t.Errorf("progress callback called %d times, want 2", len(seen))
+	}
+}
+
+// failStorage wraps FakeStorage and injects a failure for a single path.
+type failStorage struct {
+	inner  *archive.FakeStorage
+	failAt string // matches against UploadRequest.Key
+}
+
+func (f *failStorage) Upload(ctx context.Context, req archive.UploadRequest) (archive.RemoteInfo, error) {
+	if strings.HasSuffix(req.Key, f.failAt) {
+		return archive.RemoteInfo{}, fmt.Errorf("injected failure for %s", f.failAt)
+	}
+	return f.inner.Upload(ctx, req)
+}
+func (f *failStorage) HeadByKey(ctx context.Context, key string) (archive.RemoteInfo, error) {
+	return f.inner.HeadByKey(ctx, key)
+}
+func (f *failStorage) Download(ctx context.Context, key string, w io.Writer) error {
+	return f.inner.Download(ctx, key, w)
+}
+func (f *failStorage) PresignDownloadURL(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return f.inner.PresignDownloadURL(ctx, key, ttl)
+}
+
+func TestArchiveWorkerRunOnce_FailuresAggregated(t *testing.T) {
+	env := newWorkerEnv(t)
+	env.stampLocalAndEntry(t, "ok.txt", "ok")
+	env.stampLocalAndEntry(t, "bad.txt", "bad")
+
+	env.worker.Storage = &failStorage{inner: env.storage, failAt: "bad.txt"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result, err := env.worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(result.Uploaded) != 1 || result.Uploaded[0].Path != "ok.txt" {
+		t.Errorf("uploaded=%+v want [ok.txt]", result.Uploaded)
+	}
+	if len(result.Failed) != 1 || result.Failed[0].Path != "bad.txt" {
+		t.Errorf("failed=%+v want [bad.txt]", result.Failed)
 	}
 }
 

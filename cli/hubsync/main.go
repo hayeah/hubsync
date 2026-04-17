@@ -108,6 +108,14 @@ func cmdServe(args []string) {
 		log.Fatalf("create db dir: %v", err)
 	}
 
+	// Exclusive lock — blocks a second serve, or an `archive`/in-process
+	// pin/unpin, from touching this hub while we run.
+	lock, err := hubsync.AcquireHubLock(absDir)
+	if err != nil {
+		log.Fatalf("acquire hub lock: %v", err)
+	}
+	defer lock.Release()
+
 	app, cleanup, err := InitializeHubApp(&hubsync.HubConfig{
 		DBPath:   *dbPath,
 		WatchDir: absDir,
