@@ -364,6 +364,69 @@ func (s *HubStore) LatestVersion() (int64, error) {
 	return v.Int64, nil
 }
 
+// PendingArchiveRows returns file rows that need archive-worker attention:
+// either never-processed (NULL archive_state) or dirty. Ordered by path for
+// determinism.
+func (s *HubStore) PendingArchiveRows() ([]HubEntry, error) {
+	var rows []hubEntryRow
+	if err := s.DB.Select(&rows,
+		`SELECT * FROM hub_entry
+		 WHERE kind = 0 AND (archive_state IS NULL OR archive_state = 'dirty')
+		 ORDER BY path`,
+	); err != nil {
+		return nil, err
+	}
+	out := make([]HubEntry, len(rows))
+	for i, r := range rows {
+		out[i] = r.toEntry()
+	}
+	return out, nil
+}
+
+// MarkArchiveDirty transitions path's archive_state to 'dirty'. Used by the
+// scanner when it detects an overwrite-on-reappearance.
+func (s *HubStore) MarkArchiveDirty(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.DB.Exec(
+		`UPDATE hub_entry SET archive_state = 'dirty', updated_at = ?
+		   WHERE path = ?`,
+		time.Now().Unix(), path,
+	)
+	return err
+}
+
+// MarkArchived records a successful upload: flips state to 'archived' and
+// stores the remote handle + metadata.
+func (s *HubStore) MarkArchived(path, fileID string, contentSHA1 []byte, uploadedAt int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.DB.Exec(
+		`UPDATE hub_entry
+		   SET archive_state       = 'archived',
+		       archive_file_id     = ?,
+		       archive_sha1        = ?,
+		       archive_uploaded_at = ?,
+		       updated_at          = ?
+		   WHERE path = ?`,
+		fileID, contentSHA1, uploadedAt, time.Now().Unix(), path,
+	)
+	return err
+}
+
+// MarkUnpinned flips state to 'unpinned'. Archive columns (file_id/sha1/
+// uploaded_at) are preserved.
+func (s *HubStore) MarkUnpinned(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.DB.Exec(
+		`UPDATE hub_entry SET archive_state = 'unpinned', updated_at = ?
+		   WHERE path = ?`,
+		time.Now().Unix(), path,
+	)
+	return err
+}
+
 // ConfigCacheGet reads a value from hub_config_cache (for detecting destructive
 // config changes like the hash algo switching).
 func (s *HubStore) ConfigCacheGet(key string) (string, bool, error) {
