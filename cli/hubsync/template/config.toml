@@ -1,0 +1,27 @@
+# hubsync/.hubsync/config.toml
+#
+# Values in ${...} are expanded from the process environment at load time.
+# Provide those vars via your shell (`export ...`), `godotenv -f ~/.env.secret
+# hubsync ...`, direnv, mise env, or whatever you prefer.
+
+[hub]
+# Content-hash algorithm. Set once at init; switching later requires wiping
+# .hubsync/. Valid: "xxh128" (default, fast) or "sha256".
+hash = "xxh128"
+
+[archive]
+# Remove this section if you don't want B2 backup for this hub.
+
+provider      = "b2"
+bucket        = "${HUBSYNC_BUCKET}"
+bucket_prefix = "${HUBSYNC_BUCKET_PREFIX}"
+b2_key_id     = "${B2_APPLICATION_KEY_ID}"
+b2_app_key    = "${B2_APPLICATION_KEY}"
+
+# Tunables — commented defaults, uncomment to override.
+# archive_workers       = 4
+# hash_workers          = 4
+# large_file_threshold  = 104857600   # 100 MiB
+# debounce_base         = "2s"
+# debounce_per_100mb    = "1s"
+# debounce_max          = "30s"

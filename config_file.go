@@ -68,6 +68,11 @@ const DefaultHash = HashXXH128
 // LoadConfigFile reads .hubsync/config.toml under hubDir. If the file is
 // absent, returns a ConfigFile with DefaultHash. Fills in any missing defaults
 // on the returned value.
+//
+// Selected [archive] string fields (bucket, bucket_prefix, b2_key_id,
+// b2_app_key) are run through os.ExpandEnv so the template can reference
+// process-env vars like ${HUBSYNC_BUCKET} or ${B2_APPLICATION_KEY_ID} without
+// baking secrets into the committed config.
 func LoadConfigFile(hubDir string) (*ConfigFile, error) {
 	path := filepath.Join(hubDir, ".hubsync", "config.toml")
 	data, err := os.ReadFile(path)
@@ -83,6 +88,15 @@ func LoadConfigFile(hubDir string) (*ConfigFile, error) {
 	}
 	if cf.Hub.Hash == "" {
 		cf.Hub.Hash = DefaultHash
+	}
+	if cf.Archive != nil {
+		cf.Archive.Bucket = os.ExpandEnv(cf.Archive.Bucket)
+		cf.Archive.BucketPrefix = os.ExpandEnv(cf.Archive.BucketPrefix)
+		cf.Archive.B2KeyID = os.ExpandEnv(cf.Archive.B2KeyID)
+		cf.Archive.B2AppKey = os.ExpandEnv(cf.Archive.B2AppKey)
+		if cf.Archive.BucketPrefix == "" {
+			cf.Archive.BucketPrefix = filepath.Base(hubDir) + "/"
+		}
 	}
 	if err := cf.validate(); err != nil {
 		return nil, err
