@@ -15,7 +15,7 @@ func TestScannerScanAll(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "sub"), 0755)
 	os.WriteFile(filepath.Join(dir, "sub", "b.txt"), []byte("world"), 0644)
 
-	scanner := NewScanner(dir, nil)
+	scanner := NewScanner(ScannerConfig{WatchDir: dir, Hasher: sha256Hasher{}})
 	result, err := scanner.ScanAll(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestScannerScanAllDigestCache(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "cached.txt"), []byte("content"), 0644)
 
-	scanner := NewScanner(dir, nil)
+	scanner := NewScanner(ScannerConfig{WatchDir: dir, Hasher: sha256Hasher{}})
 
 	// First scan: compute digest
 	result1, _ := scanner.ScanAll(nil)
@@ -77,7 +77,7 @@ func TestScannerScanAllCacheInvalidation(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte("original"), 0644)
 
-	scanner := NewScanner(dir, nil)
+	scanner := NewScanner(ScannerConfig{WatchDir: dir, Hasher: sha256Hasher{}})
 	result1, _ := scanner.ScanAll(nil)
 	info1 := result1["file.txt"]
 
@@ -102,7 +102,7 @@ func TestScannerScanAllCacheInvalidation(t *testing.T) {
 }
 
 func TestScannerDiffCreates(t *testing.T) {
-	scanner := NewScanner("", nil) // dir not used by Diff
+	scanner := NewScanner(ScannerConfig{Hasher: sha256Hasher{}}) // dir not used by Diff
 
 	digest := ComputeDigest([]byte("new"))
 	scanned := map[string]FileInfo{
@@ -122,7 +122,7 @@ func TestScannerDiffCreates(t *testing.T) {
 }
 
 func TestScannerDiffUpdates(t *testing.T) {
-	scanner := NewScanner("", nil)
+	scanner := NewScanner(ScannerConfig{Hasher: sha256Hasher{}})
 
 	oldDigest := ComputeDigest([]byte("old"))
 	newDigest := ComputeDigest([]byte("new"))
@@ -144,7 +144,7 @@ func TestScannerDiffUpdates(t *testing.T) {
 }
 
 func TestScannerDiffDeletes(t *testing.T) {
-	scanner := NewScanner("", nil)
+	scanner := NewScanner(ScannerConfig{Hasher: sha256Hasher{}})
 
 	currentTree := map[string]TreeEntry{
 		"gone.txt": {Path: "gone.txt", Digest: ComputeDigest([]byte("x")), Size: 1},
@@ -161,7 +161,7 @@ func TestScannerDiffDeletes(t *testing.T) {
 }
 
 func TestScannerDiffNoChanges(t *testing.T) {
-	scanner := NewScanner("", nil)
+	scanner := NewScanner(ScannerConfig{Hasher: sha256Hasher{}})
 
 	digest := ComputeDigest([]byte("same"))
 	currentTree := map[string]TreeEntry{
@@ -178,7 +178,7 @@ func TestScannerDiffNoChanges(t *testing.T) {
 }
 
 func TestScannerDiffCreatesBeforeDeletes(t *testing.T) {
-	scanner := NewScanner("", nil)
+	scanner := NewScanner(ScannerConfig{Hasher: sha256Hasher{}})
 
 	digest := ComputeDigest([]byte("moved"))
 

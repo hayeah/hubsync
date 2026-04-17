@@ -1,6 +1,7 @@
 package hubsync
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -8,21 +9,45 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 )
 
 // Server serves the hub's HTTP API.
 type Server struct {
-	Hub    *Hub
-	token  BearerToken
-	listen string
-	mux    *http.ServeMux
+	Hub      *Hub
+	hasher   Hasher
+	token    BearerToken
+	listen   string
+	mux      *http.ServeMux
+	storage  archivePresigner // may be nil (no archive configured)
+	prefix   string
+	blobTTL  time.Duration
+}
+
+// archivePresigner is the narrow subset of archive.ArchiveStorage the blob
+// handler needs. Using a local interface keeps the Server decoupled from
+// the archive package while still letting wire inject the real type.
+type archivePresigner interface {
+	PresignDownloadURL(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
 // NewServer creates a Server and sets up routes.
-func NewServer(hub *Hub, token BearerToken, listen string) *Server {
-	s := &Server{Hub: hub, token: token, listen: listen, mux: http.NewServeMux()}
+func NewServer(hub *Hub, cfg ServerConfig) *Server {
+	s := &Server{
+		Hub:     hub,
+		hasher:  cfg.Hasher,
+		token:   cfg.Token,
+		listen:  cfg.Listen,
+		mux:     http.NewServeMux(),
+		storage: cfg.Presigner,
+		prefix:  cfg.Prefix,
+		blobTTL: cfg.BlobTTL,
+	}
+	if s.blobTTL == 0 {
+		s.blobTTL = time.Hour
+	}
 	s.routes()
 	return s
 }
@@ -125,7 +150,7 @@ func (s *Server) writeEvent(w io.Writer, e ChangeEntry) error {
 	} else {
 		change := &FileChange{
 			Kind:   EntryKind(e.Kind),
-			Digest: e.Digest[:],
+			Digest: e.Digest.Bytes(),
 			Size:   uint64(e.Size),
 			Mode:   e.Mode,
 			Mtime:  e.MTime,
@@ -145,7 +170,9 @@ func (s *Server) writeEvent(w io.Writer, e ChangeEntry) error {
 	return WriteLengthPrefixed(w, ev)
 }
 
-// handleBlob serves a blob by looking up the digest in the current tree.
+// handleBlob serves a blob by looking up the digest in hub_entry. If the
+// local file is absent and the row is archive_state='unpinned', fall back
+// to a 302 redirect to a presigned B2 URL (when archive is configured).
 func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	digestHex := r.PathValue("digest")
 	digest, err := ParseDigest(digestHex)
@@ -160,16 +187,33 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Prefer the local file if it's there.
 	fullPath := filepath.Join(s.Hub.Scanner.dir, path)
-	f, err := os.Open(fullPath)
-	if err != nil {
-		http.Error(w, "file not found", http.StatusNotFound)
+	if f, err := os.Open(fullPath); err == nil {
+		defer f.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.Copy(w, f)
 		return
 	}
-	defer f.Close()
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	io.Copy(w, f)
+	// Local file missing — fall back to the unpinned/archive path.
+	entry, found, err := s.Hub.Store.EntryLookup(path)
+	if err != nil || !found || entry.ArchiveState != ArchiveStateUnpinned {
+		http.Error(w, "blob not available (local missing; no archive fallback)", http.StatusNotFound)
+		return
+	}
+	if s.storage == nil {
+		http.Error(w, "blob not available (archive not configured)", http.StatusNotFound)
+		return
+	}
+
+	url, err := s.storage.PresignDownloadURL(r.Context(), s.prefix+path, s.blobTTL)
+	if err != nil {
+		log.Printf("presign %s: %v", path, err)
+		http.Error(w, "presign failed", http.StatusBadGateway)
+		return
+	}
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 // handleLatestSnapshotTree redirects to the latest snapshot-tree version.
@@ -191,7 +235,7 @@ func (s *Server) handleSnapshotTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbData, err := generateClientDB(s.Hub.Store, version)
+	dbData, err := generateClientDB(s.Hub.Store, version, s.hasher.Name())
 	if err != nil {
 		http.Error(w, "generate db", http.StatusInternalServerError)
 		return
@@ -243,8 +287,8 @@ func (s *Server) handleDelta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetDigest, err := ParseDigest(fmt.Sprintf("%x", req.TargetDigest))
-	if err != nil {
+	targetDigest := Digest(req.TargetDigest)
+	if targetDigest.IsZero() {
 		http.Error(w, "invalid target digest", http.StatusBadRequest)
 		return
 	}

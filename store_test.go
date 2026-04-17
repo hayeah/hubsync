@@ -8,15 +8,11 @@ import (
 func newTestHubStore(t *testing.T) *HubStore {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "hub.db")
-	db, err := OpenDB(dbPath)
+	store, cleanup, err := NewHubStore(HubStoreConfig{DBPath: dbPath, Hasher: sha256Hasher{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
-	store, err := NewHubStore(db)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(cleanup)
 	return store
 }
 
@@ -200,19 +196,20 @@ func TestHubStoreLoadTreeOnReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "hub.db")
 
 	// First open: write some data
-	db1, _ := OpenDB(dbPath)
-	store1, _ := NewHubStore(db1)
-	digest := ComputeDigest([]byte("persistent"))
-	store1.Append(ChangeEntry{Path: "saved.txt", Op: OpCreate, Kind: FileKindFile, Digest: digest, Size: 10, MTime: 2000})
-	db1.Close()
-
-	// Reopen: tree should be rebuilt from change_log
-	db2, _ := OpenDB(dbPath)
-	defer db2.Close()
-	store2, err := NewHubStore(db2)
+	store1, cleanup1, err := NewHubStore(HubStoreConfig{DBPath: dbPath, Hasher: sha256Hasher{}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := ComputeDigest([]byte("persistent"))
+	store1.Append(ChangeEntry{Path: "saved.txt", Op: OpCreate, Kind: FileKindFile, Digest: digest, Size: 10, MTime: 2000})
+	cleanup1()
+
+	// Reopen: tree should persist via hub_entry
+	store2, cleanup2, err := NewHubStore(HubStoreConfig{DBPath: dbPath, Hasher: sha256Hasher{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup2()
 
 	tree := store2.TreeSnapshot()
 	if len(tree) != 1 {

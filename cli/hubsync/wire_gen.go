@@ -13,35 +13,62 @@ import (
 // Injectors from wire.go:
 
 func InitializeHubApp(cfg *hubsync.HubConfig) (*hubsync.HubApp, func(), error) {
-	hubStore, cleanup, err := hubsync.ProvideHubStore(cfg)
+	hasher, err := hubsync.ProvideHubHasher(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	scanner, err := hubsync.ProvideScanner(cfg)
+	hubStoreConfig := hubsync.ProvideHubStoreConfig(cfg, hasher)
+	hubStore, cleanup, err := hubsync.NewHubStore(hubStoreConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	scannerConfig, err := hubsync.ProvideScannerConfig(cfg, hasher)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	watcher, cleanup2, err := hubsync.ProvideWatcher(cfg)
+	scanner := hubsync.NewScanner(scannerConfig)
+	watcherConfig := hubsync.ProvideWatcherConfig(cfg)
+	watcher, cleanup2, err := hubsync.NewWatcher(watcherConfig)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 	broadcaster := hubsync.NewBroadcaster()
-	hub := hubsync.NewHub(hubStore, scanner, watcher, broadcaster)
-	server := hubsync.ProvideServer(hub, cfg)
+	hub := hubsync.NewHub(hubStore, scanner, watcher, broadcaster, hasher)
+	configFile, err := hubsync.ProvideConfigFile(cfg)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	archiveStorage, cleanup3, err := hubsync.ProvideArchiveStorage(configFile)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	serverConfig := hubsync.ProvideServerConfig(cfg, configFile, hasher, archiveStorage)
+	server := hubsync.NewServer(hub, serverConfig)
+	archiveWorker := hubsync.ProvideArchiveWorker(cfg, configFile, hubStore, archiveStorage, hasher, broadcaster)
+	reconciler := hubsync.ProvideReconciler(cfg, configFile, hubStore, archiveStorage, hasher)
+	rpcServer := hubsync.ProvideRPCServer(cfg, hubStore, reconciler)
 	hubApp := &hubsync.HubApp{
-		Server: server,
-		Hub:    hub,
+		Server:        server,
+		Hub:           hub,
+		ArchiveWorker: archiveWorker,
+		RPC:           rpcServer,
 	}
 	return hubApp, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil
 }
 
 func InitializeClientApp(cfg *hubsync.ClientConfig) (*hubsync.ClientApp, func(), error) {
-	clientStore, cleanup, err := hubsync.ProvideClientStore(cfg)
+	clientStoreConfig := hubsync.ProvideClientStoreConfig(cfg)
+	clientStore, cleanup, err := hubsync.OpenClientStore(clientStoreConfig)
 	if err != nil {
 		return nil, nil, err
 	}

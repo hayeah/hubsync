@@ -14,28 +14,54 @@ import (
 
 // InitializeTestHubApp creates a HubApp for testing.
 func InitializeTestHubApp(cfg *HubConfig) (*HubApp, func(), error) {
-	hubStore, cleanup, err := ProvideHubStore(cfg)
+	hasher, err := ProvideHubHasher(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	scanner, err := ProvideScanner(cfg)
+	hubStoreConfig := ProvideHubStoreConfig(cfg, hasher)
+	hubStore, cleanup, err := NewHubStore(hubStoreConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	scannerConfig, err := ProvideScannerConfig(cfg, hasher)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	watcher, cleanup2, err := ProvideWatcher(cfg)
+	scanner := NewScanner(scannerConfig)
+	watcherConfig := ProvideWatcherConfig(cfg)
+	watcher, cleanup2, err := NewWatcher(watcherConfig)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 	broadcaster := NewBroadcaster()
-	hub := NewHub(hubStore, scanner, watcher, broadcaster)
-	server := ProvideServer(hub, cfg)
+	hub := NewHub(hubStore, scanner, watcher, broadcaster, hasher)
+	configFile, err := ProvideConfigFile(cfg)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	archiveStorage, cleanup3, err := ProvideArchiveStorage(configFile)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	serverConfig := ProvideServerConfig(cfg, configFile, hasher, archiveStorage)
+	server := NewServer(hub, serverConfig)
+	archiveWorker := ProvideArchiveWorker(cfg, configFile, hubStore, archiveStorage, hasher, broadcaster)
+	reconciler := ProvideReconciler(cfg, configFile, hubStore, archiveStorage, hasher)
+	rpcServer := ProvideRPCServer(cfg, hubStore, reconciler)
 	hubApp := &HubApp{
-		Server: server,
-		Hub:    hub,
+		Server:        server,
+		Hub:           hub,
+		ArchiveWorker: archiveWorker,
+		RPC:           rpcServer,
 	}
 	return hubApp, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil
@@ -43,7 +69,8 @@ func InitializeTestHubApp(cfg *HubConfig) (*HubApp, func(), error) {
 
 // InitializeTestClientApp creates a ClientApp for testing.
 func InitializeTestClientApp(cfg *ClientConfig) (*ClientApp, func(), error) {
-	clientStore, cleanup, err := ProvideClientStore(cfg)
+	clientStoreConfig := ProvideClientStoreConfig(cfg)
+	clientStore, cleanup, err := OpenClientStore(clientStoreConfig)
 	if err != nil {
 		return nil, nil, err
 	}

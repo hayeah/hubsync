@@ -229,7 +229,7 @@ func TestDeltaProtoRoundTrip(t *testing.T) {
 
 	// Convert to proto and back
 	digest := ComputeDigest(target)
-	protoResp := delta.ToProto(digest[:])
+	protoResp := delta.ToProto(digest.Bytes())
 	restored := DeltaOpsFromProto(protoResp)
 
 	result := ApplyDelta(base, restored, blockSize)

@@ -22,6 +22,7 @@ type Client struct {
 	hubURL  string
 	token   BearerToken
 	syncDir string
+	hasher  Hasher
 	http    *http.Client
 
 	// Write mode fields
@@ -35,7 +36,8 @@ type Client struct {
 	OnPush func(accepted int)
 }
 
-// NewClient creates a Client.
+// NewClient creates a Client. Hasher is resolved lazily from sync_state
+// after the first bootstrap; callers may pre-set it via SetHasher.
 func NewClient(store *ClientStore, hubURL string, token BearerToken, syncDir string) *Client {
 	return &Client{
 		Store:        store,
@@ -49,6 +51,30 @@ func NewClient(store *ClientStore, hubURL string, token BearerToken, syncDir str
 	}
 }
 
+// SetHasher overrides the configured hasher (primarily useful in tests).
+func (c *Client) SetHasher(h Hasher) { c.hasher = h }
+
+// ensureHasher loads the hub's hash_algo from sync_state and caches the Hasher.
+// Fresh clients that haven't bootstrapped yet fall back to DefaultHash.
+func (c *Client) ensureHasher() error {
+	if c.hasher != nil {
+		return nil
+	}
+	algo, err := c.Store.HashAlgo()
+	if err != nil {
+		return err
+	}
+	if algo == "" {
+		algo = DefaultHash
+	}
+	h, err := NewHasher(algo)
+	if err != nil {
+		return err
+	}
+	c.hasher = h
+	return nil
+}
+
 // SetWriteMode enables write mode with the given scan interval.
 func (c *Client) SetWriteMode(interval time.Duration) {
 	c.writeMode = true
@@ -60,12 +86,15 @@ func (c *Client) SetWriteMode(interval time.Duration) {
 // Bootstrap fetches the tree DB and all blobs from the hub.
 // Steps: download hub_tree DB from /snapshots-tree/latest, then fetch each blob.
 func (c *Client) Bootstrap(ctx context.Context) error {
-	// Fetch the tree DB
 	if err := c.bootstrapTreeDB(ctx); err != nil {
 		return err
 	}
+	// Snapshot just landed — the hub's hash_algo is now in sync_state.
+	c.hasher = nil
+	if err := c.ensureHasher(); err != nil {
+		return fmt.Errorf("resolve hasher: %w", err)
+	}
 
-	// Fetch all blobs referenced by the tree
 	if err := c.bootstrapBlobs(ctx); err != nil {
 		return err
 	}
@@ -79,9 +108,12 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 // Reconciles by: fetching the latest tree DB, fetching missing/changed blobs,
 // and removing local files no longer in the tree. Idempotent — safe to re-run.
 func (c *Client) Catchup(ctx context.Context) error {
-	// Fetch the latest tree DB (replaces local hub_tree state)
 	if err := c.bootstrapTreeDB(ctx); err != nil {
 		return err
+	}
+	c.hasher = nil
+	if err := c.ensureHasher(); err != nil {
+		return fmt.Errorf("resolve hasher: %w", err)
 	}
 
 	tree, err := c.Store.TreeSnapshot()
@@ -122,7 +154,7 @@ func (c *Client) reconcileBlobs(ctx context.Context, tree map[string]HubTreeEntr
 
 		// Check if local file already matches
 		if data, readErr := os.ReadFile(fullPath); readErr == nil {
-			if ComputeDigest(data) == entry.Digest {
+			if c.hasher.Sum(data) == entry.Digest {
 				skipped++
 				continue
 			}
@@ -257,7 +289,7 @@ func (c *Client) bootstrapBlobs(ctx context.Context) error {
 			return err
 		}
 		if err := c.fetchFullBlob(digest, fullPath, firstTarget.mode); err != nil {
-			return fmt.Errorf("fetch blob %s for %s: %w", digest.Hex()[:12], firstTarget.path, err)
+			return fmt.Errorf("fetch blob %s for %s: %w", shortHex(digest), firstTarget.path, err)
 		}
 
 		// Copy to other targets with same digest
@@ -285,6 +317,9 @@ func (c *Client) bootstrapBlobs(ctx context.Context) error {
 // or the connection drops. Reconnects on failure.
 // In write mode, also runs a periodic push loop.
 func (c *Client) Sync(ctx context.Context) error {
+	if err := c.ensureHasher(); err != nil {
+		return fmt.Errorf("resolve hasher: %w", err)
+	}
 	if c.writeMode {
 		return c.syncReadWrite(ctx)
 	}
@@ -414,7 +449,7 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 	switch e := ev.Event.(type) {
 	case *SyncEvent_Change:
 		change := e.Change
-		digest, _ := ParseDigest(fmt.Sprintf("%x", change.Digest))
+		digest := Digest(change.Digest)
 
 		if !skipFS {
 			// Ensure parent directory exists
@@ -461,7 +496,7 @@ func (c *Client) applyEvent(ev *SyncEvent) error {
 			}
 		}
 
-		if err := c.Store.ApplyChange(version, path, OpDelete, FileKindFile, Digest{}, 0, 0, 0); err != nil {
+		if err := c.Store.ApplyChange(version, path, OpDelete, FileKindFile, "", 0, 0, 0); err != nil {
 			return err
 		}
 
@@ -508,7 +543,7 @@ func (c *Client) fetchDelta(targetDigest Digest, localData []byte) ([]byte, erro
 
 	// Build protobuf request
 	req := &DeltaRequest{
-		TargetDigest: targetDigest[:],
+		TargetDigest: targetDigest.Bytes(),
 		BlockSize:    uint32(blockSize),
 	}
 	for _, sig := range sigs {
@@ -558,7 +593,7 @@ func (c *Client) fetchDelta(targetDigest Digest, localData []byte) ([]byte, erro
 	result := ApplyDelta(localData, ops, blockSize)
 
 	// Verify digest
-	got := ComputeDigest(result)
+	got := c.hasher.Sum(result)
 	if got != targetDigest {
 		return nil, fmt.Errorf("delta result digest mismatch: got %s, want %s", got.Hex(), targetDigest.Hex())
 	}
@@ -595,4 +630,14 @@ func (c *Client) setAuth(req *http.Request) {
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+string(c.token))
 	}
+}
+
+// shortHex returns a 12-char prefix of digest's hex for log messages, or the
+// whole thing if it's shorter.
+func shortHex(d Digest) string {
+	h := d.Hex()
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }
