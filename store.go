@@ -3,9 +3,11 @@ package hubsync
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -451,6 +453,34 @@ func (s *HubStore) MarkUnpinned(path string) error {
 		time.Now().Unix(), path,
 	)
 	return err
+}
+
+// MatchGlobs expands doublestar globs against hub_entry (the authoritative
+// tree including unpinned paths). Paths appear at most once, sorted. Zero
+// matches returns an empty slice.
+func (s *HubStore) MatchGlobs(globs []string) ([]string, error) {
+	entries, err := s.EntrySnapshot()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, g := range globs {
+		for _, e := range entries {
+			ok, err := doublestar.Match(g, e.Path)
+			if err != nil {
+				return nil, fmt.Errorf("bad glob %q: %w", g, err)
+			}
+			if ok {
+				if _, dup := seen[e.Path]; !dup {
+					seen[e.Path] = struct{}{}
+					out = append(out, e.Path)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ConfigCacheGet reads a value from hub_config_cache (for detecting destructive

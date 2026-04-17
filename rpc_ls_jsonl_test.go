@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // TestLsJSONLFormat brings up the RPC server, calls Ls, then marshals the
@@ -29,7 +30,7 @@ func TestLsJSONLFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ls, err := client.Ls(ctx, "")
+	ls, err := client.Ls(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestLsJSONLFormat(t *testing.T) {
 		Kind      string `json:"kind"`
 		State     string `json:"state"`
 		Size      int64  `json:"size"`
-		MTime     int64  `json:"mtime"`
+		MTime     string `json:"mtime"`
 		DigestHex string `json:"digest_hex"`
 	}
 
@@ -75,6 +76,10 @@ func TestLsJSONLFormat(t *testing.T) {
 		}
 		if r.Size <= 0 {
 			t.Errorf("row %q has size=%d, want >0", r.Path, r.Size)
+		}
+		// mtime is RFC3339 UTC per the ls convention
+		if _, err := time.Parse(time.RFC3339, r.MTime); err != nil {
+			t.Errorf("row %q mtime=%q not RFC3339: %v", r.Path, r.MTime, err)
 		}
 		states = append(states, r.State)
 	}

@@ -70,7 +70,7 @@ func TestRPCPinUnpinLsStatus(t *testing.T) {
 
 	// ls should show both as archived, with structured JSONL-friendly
 	// fields: path, kind, state, size, digest_hex, mtime.
-	ls, err := client.Ls(ctx, "")
+	ls, err := client.Ls(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

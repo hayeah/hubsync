@@ -164,3 +164,78 @@ func TestArchiveE2E_HubClientArchiveCoexist(t *testing.T) {
 	cancel()
 	<-workerDone
 }
+
+// TestArchiveOneShot_EndToEnd mirrors the `hubsync archive` flow at the
+// library level: take the hub lock, construct the worker by hand (same as
+// oneShotStack does in cli/hubsync/oneshot.go), run FullScan + RunOnce,
+// check the fake bucket has both files. The CLI binary-level test in
+// cli/hubsync/archive_test.go already covers --dry; this one fills in the
+// upload path without needing live B2.
+func TestArchiveOneShot_EndToEnd(t *testing.T) {
+	hubDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hubDir, ".hubsync"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hubDir, "a.txt"), []byte("alpha"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hubDir, "b.txt"), []byte("beta"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := AcquireHubLock(hubDir)
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	defer lock.Release()
+
+	hasher := sha256Hasher{}
+	store, cleanup, err := NewHubStore(HubStoreConfig{DBPath: HubDBPath(hubDir), Hasher: hasher})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	ignorer, err := ProvideIgnorer(hubDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(ScannerConfig{WatchDir: hubDir, Ignorer: ignorer, Hasher: hasher})
+	bc := NewBroadcaster()
+	hub := NewHub(store, scanner, nil, bc, hasher)
+
+	fake := archive.NewFakeStorage()
+	worker := &ArchiveWorker{
+		Store: store, Storage: fake, Hasher: hasher,
+		HubDir: hubDir, Prefix: "oneshot/", Workers: 2,
+	}
+
+	if err := hub.FullScan(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(result.Uploaded) != 2 || len(result.Failed) != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	if b, _ := fake.Bytes("oneshot/a.txt"); string(b) != "alpha" {
+		t.Errorf("remote a.txt=%q", b)
+	}
+	if b, _ := fake.Bytes("oneshot/b.txt"); string(b) != "beta" {
+		t.Errorf("remote b.txt=%q", b)
+	}
+
+	// Idempotent rerun: no uploads, no failures.
+	result2, err := worker.RunOnce(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result2.Uploaded)+len(result2.Failed) != 0 {
+		t.Errorf("second RunOnce not idempotent: %+v", result2)
+	}
+}
