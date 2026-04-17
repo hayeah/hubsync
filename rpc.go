@@ -206,9 +206,11 @@ type LsResponse struct {
 
 type LsEntry struct {
 	Path          string `json:"path"`
-	ArchiveState  string `json:"archive_state"`
+	Kind          string `json:"kind"`
+	State         string `json:"state"`
 	Size          int64  `json:"size"`
 	MTime         int64  `json:"mtime"`
+	DigestHex     string `json:"digest_hex,omitempty"`
 	ArchiveFileID string `json:"archive_file_id,omitempty"`
 }
 
@@ -230,14 +232,29 @@ func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Entries = append(out.Entries, LsEntry{
 			Path:          e.Path,
-			ArchiveState:  string(e.ArchiveState),
+			Kind:          fileKindLabel(e.Kind),
+			State:         string(e.ArchiveState),
 			Size:          e.Size,
 			MTime:         e.MTime,
+			DigestHex:     e.Digest.Hex(),
 			ArchiveFileID: e.ArchiveFileID,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+func fileKindLabel(k FileKind) string {
+	switch k {
+	case FileKindFile:
+		return "file"
+	case FileKindDirectory:
+		return "directory"
+	case FileKindSymlink:
+		return "symlink"
+	default:
+		return ""
+	}
 }
 
 // ---- status -----------------------------------------------------------
