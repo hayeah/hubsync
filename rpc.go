@@ -13,16 +13,28 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/bmatcuk/doublestar/v4"
 )
 
-// RPCSocketName is the fixed filename inside .hubsync/ that serve listens on.
-const RPCSocketName = "serve.sock"
+// Fixed filenames under .hubsync/.
+const (
+	RPCSocketName = "serve.sock"
+	HubDBName     = "hub.db"
+	HubLockName   = "hub.lock"
+)
 
 // RPCSocketPath returns the absolute path to the hub's RPC socket.
 func RPCSocketPath(hubDir string) string {
 	return filepath.Join(hubDir, ".hubsync", RPCSocketName)
+}
+
+// HubDBPath returns the absolute path to the hub's SQLite DB.
+func HubDBPath(hubDir string) string {
+	return filepath.Join(hubDir, ".hubsync", HubDBName)
+}
+
+// HubLockPath returns the absolute path to the hub's one-shot lock file.
+func HubLockPath(hubDir string) string {
+	return filepath.Join(hubDir, ".hubsync", HubLockName)
 }
 
 // RPCServer accepts local pin/unpin/ls/status requests from the CLI over a
@@ -133,26 +145,42 @@ func (s *RPCServer) handleReconcile(w http.ResponseWriter, r *http.Request, targ
 		http.Error(w, "globs required", http.StatusBadRequest)
 		return
 	}
-	matches, err := s.matchGlobs(req.Globs)
+	resp, err := RunReconcile(r.Context(), s.Reconciler, s.Store, req, target)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		code := http.StatusBadRequest
+		if errors.Is(err, ErrNoMatches) {
+			code = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), code)
 		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ErrNoMatches is returned by RunReconcile when the globs match no paths.
+var ErrNoMatches = errors.New("no matches")
+
+// RunReconcile is the in-process pin/unpin driver, shared by the RPC handler
+// and the one-shot CLI path. Expands globs, plans + (unless dry) applies each
+// path's plan, and returns a PinResponse with per-path results.
+func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req PinRequest, target TargetState) (PinResponse, error) {
+	matches, err := store.MatchGlobs(req.Globs)
+	if err != nil {
+		return PinResponse{}, err
 	}
 	if len(matches) == 0 {
-		http.Error(w, "no matches", http.StatusNotFound)
-		return
+		return PinResponse{}, ErrNoMatches
 	}
-
-	ctx := r.Context()
 	resp := PinResponse{}
 	for _, path := range matches {
 		var plan Plan
 		var planErr error
 		switch target {
 		case TargetArchived:
-			plan, planErr = s.Reconciler.PlanPin(path)
+			plan, planErr = rec.PlanPin(path)
 		case TargetUnpinned:
-			plan, planErr = s.Reconciler.PlanUnpin(path)
+			plan, planErr = rec.PlanUnpin(path)
 		}
 		res := PinResult{Path: path, StartingState: plan.StartingState, Dry: req.Dry}
 		for _, st := range plan.Steps {
@@ -161,41 +189,13 @@ func (s *RPCServer) handleReconcile(w http.ResponseWriter, r *http.Request, targ
 		if planErr != nil {
 			res.Error = planErr.Error()
 		} else if !req.Dry {
-			if err := s.Reconciler.Apply(ctx, plan); err != nil {
+			if err := rec.Apply(ctx, plan); err != nil {
 				res.Error = err.Error()
 			}
 		}
 		resp.Results = append(resp.Results, res)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// matchGlobs expands doublestar globs against hub_entry (authoritative tree
-// including unpinned paths). Zero matches returns an empty slice.
-func (s *RPCServer) matchGlobs(globs []string) ([]string, error) {
-	entries, err := s.Store.EntrySnapshot()
-	if err != nil {
-		return nil, err
-	}
-	seen := make(map[string]struct{})
-	var out []string
-	for _, g := range globs {
-		for _, e := range entries {
-			ok, err := doublestar.Match(g, e.Path)
-			if err != nil {
-				return nil, fmt.Errorf("bad glob %q: %w", g, err)
-			}
-			if ok {
-				if _, dup := seen[e.Path]; !dup {
-					seen[e.Path] = struct{}{}
-					out = append(out, e.Path)
-				}
-			}
-		}
-	}
-	sort.Strings(out)
-	return out, nil
+	return resp, nil
 }
 
 // ---- ls ---------------------------------------------------------------
@@ -204,41 +204,55 @@ type LsResponse struct {
 	Entries []LsEntry `json:"entries"`
 }
 
+// LsEntry is one row in the hub's authoritative tree, serialized as JSONL by
+// the CLI (per the `ls` / `duckql` convention). Keys are snake_case, ordered
+// deliberately: `path` is the stable identifier / first key; mtime is RFC3339
+// UTC; optional handles (digest_hex / archive_file_id) omit when empty.
 type LsEntry struct {
 	Path          string `json:"path"`
 	Kind          string `json:"kind"`
 	State         string `json:"state"`
 	Size          int64  `json:"size"`
-	MTime         int64  `json:"mtime"`
+	MTime         string `json:"mtime"` // RFC3339 UTC (e.g. "2026-04-17T13:42:05Z")
 	DigestHex     string `json:"digest_hex,omitempty"`
 	ArchiveFileID string `json:"archive_file_id,omitempty"`
 }
 
+// LocalLs reads the tree directly from the store and returns the same
+// payload the /rpc/ls handler emits. Used by the CLI's no-serve fallback
+// and by the RPC handler itself.
+func LocalLs(store *HubStore) (LsResponse, error) {
+	entries, err := store.EntrySnapshot()
+	if err != nil {
+		return LsResponse{}, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	out := LsResponse{Entries: make([]LsEntry, 0, len(entries))}
+	for _, e := range entries {
+		out.Entries = append(out.Entries, EntryToLs(e))
+	}
+	return out, nil
+}
+
+// EntryToLs projects a HubEntry onto the wire shape used by `ls` and
+// `archive --dry`.
+func EntryToLs(e HubEntry) LsEntry {
+	return LsEntry{
+		Path:          e.Path,
+		Kind:          fileKindLabel(e.Kind),
+		State:         string(e.ArchiveState),
+		Size:          e.Size,
+		MTime:         time.Unix(e.MTime, 0).UTC().Format(time.RFC3339),
+		DigestHex:     e.Digest.Hex(),
+		ArchiveFileID: e.ArchiveFileID,
+	}
+}
+
 func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
-	glob := r.URL.Query().Get("glob")
-	entries, err := s.Store.EntrySnapshot()
+	out, err := LocalLs(s.Store)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	var out LsResponse
-	for _, e := range entries {
-		if glob != "" {
-			ok, _ := doublestar.Match(glob, e.Path)
-			if !ok {
-				continue
-			}
-		}
-		out.Entries = append(out.Entries, LsEntry{
-			Path:          e.Path,
-			Kind:          fileKindLabel(e.Kind),
-			State:         string(e.ArchiveState),
-			Size:          e.Size,
-			MTime:         e.MTime,
-			DigestHex:     e.Digest.Hex(),
-			ArchiveFileID: e.ArchiveFileID,
-		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -277,12 +291,13 @@ type ArchiveCounts struct {
 	Bytes int64 `json:"bytes"`
 }
 
-func (s *RPCServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+// LocalStatus computes counts directly from the store. Used by the CLI's
+// no-serve fallback and by the RPC handler itself.
+func LocalStatus(store *HubStore) (StatusResponse, error) {
 	var out StatusResponse
-	entries, err := s.Store.EntrySnapshot()
+	entries, err := store.EntrySnapshot()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return out, err
 	}
 	for _, e := range entries {
 		switch e.Kind {
@@ -308,6 +323,15 @@ func (s *RPCServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			out.Null.Count++
 			out.Null.Bytes += e.Size
 		}
+	}
+	return out, nil
+}
+
+func (s *RPCServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	out, err := LocalStatus(s.Store)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -348,12 +372,8 @@ func (c *RPCClient) Unpin(ctx context.Context, req PinRequest) (*PinResponse, er
 	return callRPC[PinResponse](ctx, c, "POST", "/rpc/unpin", req)
 }
 
-func (c *RPCClient) Ls(ctx context.Context, glob string) (*LsResponse, error) {
-	path := "/rpc/ls"
-	if glob != "" {
-		path += "?glob=" + strings.NewReplacer("&", "%26", "+", "%2B", " ", "%20").Replace(glob)
-	}
-	return callRPC[LsResponse](ctx, c, "GET", path, nil)
+func (c *RPCClient) Ls(ctx context.Context) (*LsResponse, error) {
+	return callRPC[LsResponse](ctx, c, "GET", "/rpc/ls", nil)
 }
 
 func (c *RPCClient) Status(ctx context.Context) (*StatusResponse, error) {

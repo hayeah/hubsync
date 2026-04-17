@@ -282,39 +282,38 @@ func cmdPin(args []string, target hubsync.TargetState) {
 
 // --- ls ------------------------------------------------------------------
 
+// cmdLs follows the shared `ls` / `duckql` convention: no bespoke filter
+// flags (pipe to duckql instead), TTY → human table, pipe → JSONL.
+// Talks to a running serve via RPC when the socket is reachable; otherwise
+// opens the hub DB read-only in-process (SQLite WAL permits this alongside
+// a writer, so it's safe even if serve crashed mid-run).
 func cmdLs(args []string) {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
 	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
+	quiet := fs.Bool("quiet", false, "suppress warnings on stderr (no effect today)")
 	fs.Parse(args)
-
-	glob := ""
-	if fs.NArg() > 0 {
-		glob = fs.Arg(0)
-	}
+	_ = quiet // convention placeholder — no warnings emitted yet
 
 	hubDir, err := locateHubDir(*dir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := c.Ls(ctx, glob)
+	resp, err := fetchLs(ctx, hubDir)
 	if err != nil {
 		log.Fatalf("ls: %v", err)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	for _, e := range resp.Entries {
-		if err := enc.Encode(e); err != nil {
-			log.Fatalf("ls encode: %v", err)
-		}
-	}
+	renderLs(os.Stdout, resp.Entries)
 }
 
 // --- status --------------------------------------------------------------
 
+// cmdStatus prints hub tree + archive counts. Talks to a running serve
+// via RPC when reachable; otherwise reads the hub DB directly.
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "JSON output")
@@ -325,11 +324,10 @@ func cmdStatus(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, err := c.Status(ctx)
+	s, err := fetchStatus(ctx, hubDir)
 	if err != nil {
 		log.Fatalf("status: %v", err)
 	}
