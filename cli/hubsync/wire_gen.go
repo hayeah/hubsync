@@ -36,13 +36,31 @@ func InitializeHubApp(cfg *hubsync.HubConfig) (*hubsync.HubApp, func(), error) {
 	}
 	broadcaster := hubsync.NewBroadcaster()
 	hub := hubsync.NewHub(hubStore, scanner, watcher, broadcaster, hasher)
-	serverConfig := hubsync.ProvideServerConfig(cfg, hasher)
+	configFile, err := hubsync.ProvideConfigFile(cfg)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	archiveStorage, cleanup3, err := hubsync.ProvideArchiveStorage(configFile)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	serverConfig := hubsync.ProvideServerConfig(cfg, configFile, hasher, archiveStorage)
 	server := hubsync.NewServer(hub, serverConfig)
+	archiveWorker := hubsync.ProvideArchiveWorker(cfg, configFile, hubStore, archiveStorage, hasher, broadcaster)
+	reconciler := hubsync.ProvideReconciler(cfg, configFile, hubStore, archiveStorage, hasher)
+	rpcServer := hubsync.ProvideRPCServer(cfg, hubStore, reconciler)
 	hubApp := &hubsync.HubApp{
-		Server: server,
-		Hub:    hub,
+		Server:        server,
+		Hub:           hub,
+		ArchiveWorker: archiveWorker,
+		RPC:           rpcServer,
 	}
 	return hubApp, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil

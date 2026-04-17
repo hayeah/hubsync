@@ -255,6 +255,10 @@ func (s *HubStore) Append(entry ChangeEntry) (int64, error) {
 			   version    = excluded.version,
 			   updated_at = excluded.updated_at,
 			   archive_state = CASE
+			     -- local file reappearance on an unpinned row: always
+			     -- reconcile through 'dirty' so the archive worker
+			     -- re-verifies (or short-circuits on digest match).
+			     WHEN hub_entry.archive_state = 'unpinned' THEN 'dirty'
 			     WHEN hub_entry.digest IS NOT excluded.digest THEN 'dirty'
 			     ELSE hub_entry.archive_state
 			   END`,
@@ -271,10 +275,32 @@ func (s *HubStore) Append(entry ChangeEntry) (int64, error) {
 }
 
 // TreeSnapshot returns the materialized tree (scanner columns only) as a map
-// keyed by path. Ignores archive_state.
+// keyed by path. Includes unpinned rows — callers that want only
+// locally-present rows should use ScanBaselineSnapshot.
 func (s *HubStore) TreeSnapshot() map[string]TreeEntry {
 	var rows []hubEntryRow
 	if err := s.DB.Select(&rows, `SELECT * FROM hub_entry`); err != nil {
+		return map[string]TreeEntry{}
+	}
+	m := make(map[string]TreeEntry, len(rows))
+	for _, r := range rows {
+		e := r.toEntry()
+		m[e.Path] = e.TreeEntry()
+	}
+	return m
+}
+
+// ScanBaselineSnapshot is the tree view the scanner diffs against. It excludes
+// rows with archive_state='unpinned' so their intentional absence from disk
+// does not produce a delete event. A reappearance is detected by Diff as a
+// create, and the upsert in Append flips the row back through 'dirty' for
+// the archive worker to reconcile.
+func (s *HubStore) ScanBaselineSnapshot() map[string]TreeEntry {
+	var rows []hubEntryRow
+	if err := s.DB.Select(&rows,
+		`SELECT * FROM hub_entry
+		 WHERE archive_state IS NULL OR archive_state != 'unpinned'`,
+	); err != nil {
 		return map[string]TreeEntry{}
 	}
 	m := make(map[string]TreeEntry, len(rows))

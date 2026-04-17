@@ -120,6 +120,10 @@ func (s *RPCServer) handleUnpin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *RPCServer) handleReconcile(w http.ResponseWriter, r *http.Request, target TargetState) {
+	if s.Reconciler == nil {
+		http.Error(w, "archive not configured ([archive] section missing from .hubsync/config.toml)", http.StatusServiceUnavailable)
+		return
+	}
 	var req PinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)

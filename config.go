@@ -1,6 +1,11 @@
 package hubsync
 
-import "github.com/hayeah/go-lstree"
+import (
+	"context"
+	"time"
+
+	"github.com/hayeah/go-lstree"
+)
 
 // HubConfig is the user-facing hub configuration (populated by the CLI from
 // flags + .hubsync/config.toml). Per-type providers in providers.go derive
@@ -67,6 +72,14 @@ type ServerConfig struct {
 	Listen string
 	Token  BearerToken
 	Hasher Hasher
+	// Presigner + Prefix + BlobTTL are the archive hooks for the
+	// /blobs/{digest} 302 fallback. Presigner is nil when [archive] is
+	// not configured; the fallback branch returns 404 in that case.
+	Presigner interface {
+		PresignDownloadURL(ctx context.Context, key string, ttl time.Duration) (string, error)
+	}
+	Prefix  string
+	BlobTTL time.Duration
 }
 
 // ClientStoreConfig bundles what NewClientStore needs.

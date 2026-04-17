@@ -37,13 +37,31 @@ func InitializeTestHubApp(cfg *HubConfig) (*HubApp, func(), error) {
 	}
 	broadcaster := NewBroadcaster()
 	hub := NewHub(hubStore, scanner, watcher, broadcaster, hasher)
-	serverConfig := ProvideServerConfig(cfg, hasher)
+	configFile, err := ProvideConfigFile(cfg)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	archiveStorage, cleanup3, err := ProvideArchiveStorage(configFile)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	serverConfig := ProvideServerConfig(cfg, configFile, hasher, archiveStorage)
 	server := NewServer(hub, serverConfig)
+	archiveWorker := ProvideArchiveWorker(cfg, configFile, hubStore, archiveStorage, hasher, broadcaster)
+	reconciler := ProvideReconciler(cfg, configFile, hubStore, archiveStorage, hasher)
+	rpcServer := ProvideRPCServer(cfg, hubStore, reconciler)
 	hubApp := &HubApp{
-		Server: server,
-		Hub:    hub,
+		Server:        server,
+		Hub:           hub,
+		ArchiveWorker: archiveWorker,
+		RPC:           rpcServer,
 	}
 	return hubApp, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil

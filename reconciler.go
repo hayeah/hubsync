@@ -228,7 +228,14 @@ func (r *Reconciler) Restore(ctx context.Context, path string) error {
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return fmt.Errorf("mkdir parent: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(fullPath), filepath.Base(fullPath)+".hubsync.*")
+	// Stage the download in .hubsync/tmp/ so the scanner's ignorer swallows
+	// the intermediate file (otherwise fsnotify fires on create, FullScan
+	// would materialize a row, and we'd race with the rename).
+	stageDir := filepath.Join(r.HubDir, ".hubsync", "tmp")
+	if err := os.MkdirAll(stageDir, 0755); err != nil {
+		return fmt.Errorf("mkdir stage: %w", err)
+	}
+	tmp, err := os.CreateTemp(stageDir, "restore-*")
 	if err != nil {
 		return fmt.Errorf("tmpfile: %w", err)
 	}

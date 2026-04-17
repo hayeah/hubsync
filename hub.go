@@ -48,7 +48,10 @@ func (h *Hub) Start(ctx context.Context) error {
 
 // FullScan scans the directory and appends any changes to the store.
 func (h *Hub) FullScan() error {
-	tree := h.Store.TreeSnapshot()
+	// Baseline excludes unpinned rows so their intentional local absence
+	// does not emit a delete. Digest caching still works: unpinned rows
+	// are never stat-matched (they don't exist on disk).
+	tree := h.Store.ScanBaselineSnapshot()
 	scanned, err := h.Scanner.ScanAll(tree)
 	if err != nil {
 		return err
