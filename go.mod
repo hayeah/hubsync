@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/Backblaze/blazer v0.7.2 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
