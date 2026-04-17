@@ -15,6 +15,9 @@ Files are opaque blobs — no content-level merging. Conflicts produce a "confli
 # Build
 cd cli/hubsync && go build -o hubsync .
 
+# Scaffold .hubsync/config.toml (optional; only needed for B2 archive)
+./hubsync init /path/to/files
+
 # Start hub (watches current directory)
 HUBSYNC_TOKEN=secret ./hubsync serve -dir /path/to/files -listen 127.0.0.1:8080
 
@@ -30,7 +33,13 @@ HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/r
 
 ## Backblaze B2 archive
 
-Optionally, a hub can back itself up to Backblaze B2 and let the operator evict local copies via `hubsync unpin`. Enable by adding an `[archive]` section to `.hubsync/config.toml`:
+Optionally, a hub can back itself up to Backblaze B2 and let the operator evict local copies via `hubsync unpin`. Bootstrap a default config with:
+
+```bash
+hubsync init /path/to/hub
+```
+
+That drops `.hubsync/config.toml` (see `docs/config.example.toml`) with an `[archive]` section that picks its values up from the process env:
 
 ```toml
 [hub]
@@ -38,12 +47,21 @@ hash = "xxh128"                         # or "sha256"; set once at init
 
 [archive]
 provider      = "b2"
-bucket        = "my-bucket"
-bucket_prefix = "backups/laptop-home/"
-# b2_key_id   = "..."                   # falls back to B2_APPLICATION_KEY_ID env
-# b2_app_key  = "..."                   # falls back to B2_APPLICATION_KEY env
-# archive_workers = 4
+bucket        = "${HUBSYNC_BUCKET}"
+bucket_prefix = "${HUBSYNC_BUCKET_PREFIX}"
+b2_key_id     = "${B2_APPLICATION_KEY_ID}"
+b2_app_key    = "${B2_APPLICATION_KEY}"
 ```
+
+`LoadConfigFile` runs `os.ExpandEnv` over the `[archive]` string fields (`bucket`, `bucket_prefix`, `b2_key_id`, `b2_app_key`) so you can:
+
+- export the vars in your shell,
+- prefix commands with `godotenv -f ~/.env.secret hubsync …`,
+- use direnv / mise env / whatever,
+
+…and keep secrets out of the committed config. If `bucket_prefix` resolves empty (unset env var or literal empty), it defaults to `<hub-dir-basename>/` — so one exported `HUBSYNC_BUCKET` serves N hubs, each with its own prefix.
+
+If you'd rather not use env vars, just edit `.hubsync/config.toml` and hard-code the values. `hubsync init` refuses to overwrite an existing file.
 
 When the config is present, `hubsync serve` starts an archive worker that uploads every file under the hub directory to `<bucket>/<bucket_prefix>`. Each upload stamps `X-Bz-Info-hubsync_digest` + `X-Bz-Info-hubsync_digest_algo` so an operator (or a future `fsck`) can cross-check content.
 
@@ -60,6 +78,16 @@ hubsync unpin '**/*.tmp'  --dry         # show the plan, mutate nothing
 **Pin state is a data-fetch concern, not a tree-visibility concern.** Clients still see unpinned rows in `hub_tree`; `GET /blobs/{digest}` on a hub whose local copy is gone transparently returns a 302 to a short-lived presigned B2 URL.
 
 ## CLI
+
+### `hubsync init`
+
+Scaffold `.hubsync/config.toml` under `dir` (default: current directory) from the embedded template. Refuses to overwrite an existing config — remove it by hand to re-init. Never touches `hub.db`, `serve.sock`, or other files under `.hubsync/`.
+
+```
+hubsync init [dir]
+```
+
+The scaffolded config references env vars via `${VAR}` interpolation for bucket / prefix / B2 credentials. See "Backblaze B2 archive" above.
 
 ### `hubsync serve`
 
@@ -142,8 +170,10 @@ Grouped archive counts.
 | Variable | Description |
 |---|---|
 | `HUBSYNC_TOKEN` | Bearer token for auth. Set on both hub and client. If unset on hub, no auth required. |
-| `B2_APPLICATION_KEY_ID` | B2 app key ID (falls back from `[archive] b2_key_id` in config.toml) |
-| `B2_APPLICATION_KEY` | B2 app key secret (falls back from `[archive] b2_app_key`) |
+| `B2_APPLICATION_KEY_ID` | B2 app key ID. Used via `${B2_APPLICATION_KEY_ID}` in the scaffolded `[archive] b2_key_id`, or as a direct fallback when that field is empty. |
+| `B2_APPLICATION_KEY` | B2 app key secret (same pattern as above). |
+| `HUBSYNC_BUCKET` | B2 bucket name, via `${HUBSYNC_BUCKET}` in the scaffolded `[archive] bucket`. |
+| `HUBSYNC_BUCKET_PREFIX` | B2 object-key prefix, via `${HUBSYNC_BUCKET_PREFIX}` in the scaffolded `[archive] bucket_prefix`. When empty, defaults to `<hub-dir-basename>/`. |
 
 ## Architecture
 
