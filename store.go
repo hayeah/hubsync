@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -321,6 +322,31 @@ func (s *HubStore) ScanBaselineSnapshot() map[string]TreeEntry {
 func (s *HubStore) EntrySnapshot() ([]HubEntry, error) {
 	var rows []hubEntryRow
 	if err := s.DB.Select(&rows, `SELECT * FROM hub_entry`); err != nil {
+		return nil, err
+	}
+	out := make([]HubEntry, len(rows))
+	for i, r := range rows {
+		out[i] = r.toEntry()
+	}
+	return out, nil
+}
+
+// EntriesByPrefix returns hub_entry rows whose path equals prefix or begins
+// with prefix. Empty prefix returns every row (same as EntrySnapshot). The
+// prefix is applied as a literal string — callers that want dir-prefix
+// semantics should pass a trailing "/".
+func (s *HubStore) EntriesByPrefix(prefix string) ([]HubEntry, error) {
+	if prefix == "" {
+		return s.EntrySnapshot()
+	}
+	var rows []hubEntryRow
+	// path = prefix covers the dir row at an exact hub-relative path
+	// (scanner materializes dir rows without the trailing slash).
+	// path LIKE prefix || '%' covers everything under the dir-prefix.
+	if err := s.DB.Select(&rows,
+		`SELECT * FROM hub_entry WHERE path = ? OR path LIKE ? || '%'`,
+		strings.TrimSuffix(prefix, "/"), prefix,
+	); err != nil {
 		return nil, err
 	}
 	out := make([]HubEntry, len(rows))

@@ -66,7 +66,6 @@ func (s *RPCServer) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /rpc/pin", s.auth(s.handlePin))
 	mux.HandleFunc("POST /rpc/unpin", s.auth(s.handleUnpin))
-	mux.HandleFunc("GET /rpc/ls", s.auth(s.handleLs))
 	mux.HandleFunc("GET /rpc/status", s.auth(s.handleStatus))
 	srv := &http.Server{Handler: mux}
 
@@ -200,33 +199,81 @@ func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req Pin
 
 // ---- ls ---------------------------------------------------------------
 
-// LsResponse is the payload for `/rpc/ls` and the no-serve `LocalLs`
-// fallback. Entries are sorted by path; each entry is a HubEntry
-// serialized through its JSON tags (one key per SQL column).
+// LsRequest controls what LocalLs returns. In-process only — `ls` is a
+// read-only verb that opens hub.db directly (SQLite WAL permits a reader
+// alongside a live writer), so there is no serve RPC path and no wire
+// encoding for this struct.
+type LsRequest struct {
+	// Prefix is a hub-relative dir-prefix ("" = root, "foo/bar/" = under
+	// foo/bar). Ignored when All is true.
+	Prefix string
+	// All returns every hub_entry row (the pre-prefix behavior). Prefix
+	// is ignored when set.
+	All bool
+}
+
+// LsResponse is the payload returned by LocalLs. Entries are sorted by
+// path; each entry is a HubEntry serialized through its JSON tags (one
+// key per SQL column). Synthetic prefix-dir entries are emitted as
+// HubEntry{Kind: FileKindDirectory, Path: "<prefix>/..."} with a
+// trailing slash in Path — the only way a caller can tell a synthetic
+// dir from a real dir row.
 type LsResponse struct {
 	Entries []HubEntry `json:"entries"`
 }
 
-// LocalLs reads the tree directly from the store and returns the same
-// payload the /rpc/ls handler emits. Used by the CLI's no-serve fallback
-// and by the RPC handler itself.
-func LocalLs(store *HubStore) (LsResponse, error) {
-	entries, err := store.EntrySnapshot()
+// LocalLs reads the tree directly from the store. Three modes:
+//
+//   - req.All: every hub_entry row (sorted by path).
+//   - req.Prefix == "": top-level entries only, collapsed by "/".
+//   - req.Prefix == "foo/": one level below foo/, collapsed by "/".
+//
+// The CLI is the only caller; the `/rpc/ls` endpoint was removed (ls is
+// read-only and opens hub.db directly).
+func LocalLs(store *HubStore, req LsRequest) (LsResponse, error) {
+	if req.All {
+		entries, err := store.EntrySnapshot()
+		if err != nil {
+			return LsResponse{}, err
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+		return LsResponse{Entries: entries}, nil
+	}
+	entries, err := store.EntriesByPrefix(req.Prefix)
 	if err != nil {
 		return LsResponse{}, err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	return LsResponse{Entries: entries}, nil
+	return LsResponse{Entries: DelimitedEntries(entries, req.Prefix)}, nil
 }
 
-func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
-	out, err := LocalLs(s.Store)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+// DelimitedEntries collapses rows that live more than one "/" level below
+// prefix into a synthetic dir entry, and emits rows at the prefix level
+// as-is. prefix is expected to be "" or end with "/".
+func DelimitedEntries(rows []HubEntry, prefix string) []HubEntry {
+	var files []HubEntry
+	dirs := make(map[string]struct{})
+	for _, r := range rows {
+		if !strings.HasPrefix(r.Path, prefix) {
+			continue
+		}
+		suffix := r.Path[len(prefix):]
+		if suffix == "" {
+			// The dir row at an exact prefix match — skip. Its
+			// children are what the caller asked to see.
+			continue
+		}
+		idx := strings.Index(suffix, "/")
+		if idx == -1 {
+			files = append(files, r)
+			continue
+		}
+		dirs[prefix+suffix[:idx+1]] = struct{}{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	for dirPath := range dirs {
+		files = append(files, HubEntry{Path: dirPath, Kind: FileKindDirectory})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return files
 }
 
 // ---- status -----------------------------------------------------------
@@ -321,17 +368,14 @@ func NewRPCClient(socket, token string) *RPCClient {
 	}
 }
 
-// Pin / Unpin / Ls / Status perform the corresponding RPC round-trip.
+// Pin / Unpin / Status perform the corresponding RPC round-trip. `ls` has
+// no client method: it's read-only and opens hub.db directly.
 func (c *RPCClient) Pin(ctx context.Context, req PinRequest) (*PinResponse, error) {
 	return callRPC[PinResponse](ctx, c, "POST", "/rpc/pin", req)
 }
 
 func (c *RPCClient) Unpin(ctx context.Context, req PinRequest) (*PinResponse, error) {
 	return callRPC[PinResponse](ctx, c, "POST", "/rpc/unpin", req)
-}
-
-func (c *RPCClient) Ls(ctx context.Context) (*LsResponse, error) {
-	return callRPC[LsResponse](ctx, c, "GET", "/rpc/ls", nil)
 }
 
 func (c *RPCClient) Status(ctx context.Context) (*StatusResponse, error) {

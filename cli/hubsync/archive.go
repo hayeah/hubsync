@@ -28,24 +28,20 @@ func cmdArchive(args []string) {
 	dry := fs.Bool("dry", false, "list pending uploads as JSONL and exit without touching B2")
 	quiet := fs.Bool("quiet", false, "suppress per-file progress on stderr")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: hubsync archive [dir] [--dry] [--quiet]\n\nOne-shot: scan the hub dir and upload every pending file to B2, then exit.\n")
+		fmt.Fprintf(os.Stderr, "usage: hubsync archive [--dry] [--quiet]\n\nOne-shot: scan the hub (cwd's .hubsync/) and upload every pending file to B2, then exit.\n")
 	}
 	fs.Parse(args)
 
-	dir := "."
-	switch fs.NArg() {
-	case 0:
-	case 1:
-		dir = fs.Arg(0)
-	default:
+	if fs.NArg() != 0 {
 		fs.Usage()
 		os.Exit(2)
 	}
 
-	hubDir, err := locateHubDir(dir)
+	hc, err := hubContext()
 	if err != nil {
 		fatalf("%v", err)
 	}
+	hubDir := hc.root
 
 	// --dry is pure read: no B2 credentials required. Only the upload path
 	// needs the storage client.
