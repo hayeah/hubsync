@@ -32,6 +32,8 @@ func main() {
 		cmdClient(os.Args[2:])
 	case "archive":
 		cmdArchive(os.Args[2:])
+	case "archive-gc":
+		cmdArchiveGC(os.Args[2:])
 	case "pin":
 		cmdPin(os.Args[2:], hubsync.TargetArchived)
 	case "unpin":
@@ -55,6 +57,7 @@ Usage:
   hubsync serve    [flags]                    Run the hub (scanner + watcher + archive + RPC).
   hubsync client   [flags]                    Run a replica (read or write mode).
   hubsync archive  [dir] [--dry] [--quiet]    One-shot: scan + upload pending files to B2, then exit.
+  hubsync archive-gc <prefix> [--dry]         List a B2 prefix and delete objects no hub_entry claims.
   hubsync pin      <glob>... [--dry]          Ensure matched paths are archived (remote + local).
   hubsync unpin    <glob>... [--dry]          Ensure matched paths are unpinned (remote only).
   hubsync ls       [--quiet]                  List every tree entry (JSONL when piped, table on TTY).
