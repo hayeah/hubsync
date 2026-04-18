@@ -147,6 +147,49 @@ godotenv -f ~/.env.secret hubsync archive ./dist
 hubsync archive ./dist --dry | duckql "SELECT state, count(*) GROUP BY 1"
 ```
 
+### `hubsync archive-gc`
+
+One-shot: lists a B2 prefix and deletes objects that no local `hub_entry` row claims. Useful for retiring orphaned test cruft, saturation-probe bytes, or whole sid/ trees that nobody owns anymore.
+
+```
+hubsync archive-gc <prefix> [--dry] [-dir DIR]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| positional `prefix` | (required) | Bucket-relative key prefix. Literal string, not a glob. |
+| `--dry` | `false` | Classify without deleting; emit JSONL of would-be actions. |
+| `-dir` | `.` | Hub directory (walks up looking for `.hubsync/`). Hard error if not found. |
+
+`archive-gc` is a thin wrapper around B2's native list primitive: **one invocation ↔ one delimited list call at the given prefix** (plus a flat sweep per orphan dir we actually delete). Each listed entry is either a real file or a common-prefix "dir" marker, and is classified against `hub_entry`:
+
+- **File** — kept if some `hub_entry` row's `bucket_prefix + path` equals the key; otherwise deleted.
+- **Dir** (common prefix, ends in `/`) — kept if any `hub_entry` row lives under that prefix; otherwise the whole subtree is deleted.
+
+There's no `--depth N` flag because B2's list API is single-level — if you want to audit *inside* a kept dir, re-run with a deeper prefix. Keeping invocations 1:1 with the API keeps the cost and blast radius obvious at each step.
+
+`archive-gc` does **not** take `.hubsync/hub.lock`. It reads `hub.db` through SQLite WAL (safe alongside a running `serve`) and only writes to B2. A per-object fileID guard on `DeleteByKey` protects against the list→delete race where a new version could have been uploaded at the same key — that guard is free (piggybacks on blazer's implicit HEAD inside `Object.Delete`).
+
+Exit codes: `0` = success (or `--dry` succeeded); `1` = one or more deletes failed (others still attempted); `2` = startup failure (no `.hubsync`, missing `[archive]`, bad prefix).
+
+Flags must precede the positional (Go's `flag` package stops at the first non-flag).
+
+**Does NOT retire tracked rows.** If a path has a `hub_entry` row, `archive-gc` keeps it — even if you'd prefer it gone. Retiring a tracked row (evicting the DB row + the B2 copy + the local file together) is a separate concern with its own eventual verb.
+
+**Cost note**: B2's Class C list transactions are generously free-tiered (2,500/day). Per-object deletes are Class A (not free) — for large time-based cleanup of whole prefixes (e.g. "everything under `b2cast-test/` older than 14 days"), a B2 bucket-level lifecycle rule is free and strictly cheaper than `archive-gc`. Use `archive-gc` for targeted, claim-aware cleanup; use lifecycle rules for blanket retention policy.
+
+```bash
+# Preview: what would get deleted under this prefix?
+hubsync archive-gc --dry b2cast-test/2026-04-17/ | duckql \
+  "SELECT action, count(*) FROM stdin GROUP BY 1"
+
+# Actually clean up a bucket-side-only orphan prefix the hub never tracked.
+# (Run from inside any hub whose bucket is the same one — the hub's rows all
+# live under its own bucket_prefix, so nothing matches these keys: everything
+# is classified as orphan.)
+hubsync archive-gc b2cast-saturate/2026-04-17/
+```
+
 ### `hubsync pin` / `hubsync unpin`
 
 Declarative commands; the argument is a doublestar glob, the command is the target state.
