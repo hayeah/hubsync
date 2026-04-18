@@ -118,12 +118,12 @@ godotenv -f ~/.env.secret /tmp/hubsync archive $SMOKE
 
 # Verify — ls / status work without serve (DB read-only fallback)
 /tmp/hubsync status -dir $SMOKE
-/tmp/hubsync ls     -dir $SMOKE | duckql "WHERE state='archived' SELECT count(*)"
+/tmp/hubsync ls     -dir $SMOKE | duckql "SELECT count(*) WHERE archive_state='archived'"
 
 rm -rf $SMOKE
 ```
 
-Success criteria: `archive --dry` prints one JSONL row per file with `"state":""`; real `archive` prints per-file progress on stderr + a summary; re-running `archive` is a no-op (rows are already `archived`); `ls` works without any `serve` running.
+Success criteria: `archive --dry` prints one JSONL row per file with `"archive_state":""`; real `archive` prints per-file progress on stderr + a summary; re-running `archive` is a no-op (rows are already `archived`); `ls` works without any `serve` running.
 
 ## Credentials & secrets
 

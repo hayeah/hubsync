@@ -171,36 +171,44 @@ hubsync ls [--quiet]
 | `-dir` | `.` | Hub directory |
 | `--quiet` | `false` | Suppress warnings on stderr (no-op today — convention placeholder) |
 
-**TTY auto-detection**: on a terminal, `ls` renders a human-readable `tabwriter` table; when piped, it emits JSONL — one object per line.
+Output is **always JSONL**, one row per `hub_entry` row. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
 
-Row fields (JSONL):
+Row fields — one JSON key per `hub_entry` column, no synthesis:
 
-| field | meaning |
-|---|---|
-| `path` | path relative to the hub root |
-| `kind` | `file`, `directory`, or `symlink` |
-| `state` | archive state: `archived`, `unpinned`, `dirty`, or `""` (pre-archive / NULL) |
-| `size` | bytes |
-| `mtime` | RFC3339 UTC timestamp (e.g. `"2026-04-17T13:42:05Z"`) |
-| `digest_hex` | content digest hex (xxh128 or sha256, per `[hub].hash`) |
-| `archive_file_id` | B2 fileId (only for archived rows) |
+| field | SQL column | meaning |
+|---|---|---|
+| `path` | `path` | path relative to the hub root |
+| `kind` | `kind` | `"file"` / `"directory"` / `"symlink"` (from the `kind INTEGER` enum) |
+| `digest` | `digest` | content digest hex (xxh128 or sha256, per `[hub].hash`); omitted when NULL |
+| `size` | `size` | bytes |
+| `mode` | `mode` | POSIX mode bits as a decimal integer |
+| `mtime` | `mtime` | unix seconds |
+| `version` | `version` | change_log version that last touched the row |
+| `archive_state` | `archive_state` | `""` (NULL) / `"dirty"` / `"archived"` / `"unpinned"` |
+| `archive_file_id` | `archive_file_id` | B2 fileId; omitted until the archive worker uploads |
+| `archive_sha1` | `archive_sha1` | B2 contentSha1 hex; omitted until uploaded |
+| `archive_uploaded_at` | `archive_uploaded_at` | unix millis; omitted until uploaded |
+| `updated_at` | `updated_at` | unix seconds; row's last write |
 
 `hubsync archive --dry` emits the **same** row shape, so any query that works for `ls` works for the dry-run preview.
 
 Examples (assumes `duckql` on `$PATH`):
 
 ```bash
-# Filter by state
-hubsync ls | duckql "WHERE state='unpinned'"
+# Filter by archive state
+hubsync ls | duckql "WHERE archive_state='unpinned'"
 
 # Aggregate
-hubsync ls | duckql "SELECT state, count(*) AS n GROUP BY 1 ORDER BY n DESC"
+hubsync ls | duckql "SELECT archive_state, count(*) AS n GROUP BY 1 ORDER BY n DESC"
 
 # Paths over 1 MB, sorted desc
 hubsync ls | duckql "SELECT path, size WHERE kind='file' AND size > 1000000 ORDER BY size DESC"
 
 # Preview an archive run
 hubsync archive --dry | duckql "SELECT path, size ORDER BY size DESC LIMIT 10"
+
+# Recently archived rows
+hubsync ls | duckql "SELECT path, to_timestamp(archive_uploaded_at/1000) AS at WHERE archive_state='archived' ORDER BY at DESC LIMIT 10"
 ```
 
 ### `hubsync status`
