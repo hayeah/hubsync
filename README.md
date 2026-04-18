@@ -215,23 +215,98 @@ A sample row:
 
 `hubsync archive --dry` emits the **same** row shape, so any query that works for `ls` works for the dry-run preview.
 
-Examples (assumes `duckql` on `$PATH`):
+#### Examples with `duckql`
+
+The output is a plain stream of JSON rows; everything below assumes `duckql` is on `$PATH` (see [the duckql skill](https://github.com/hayeah/duckql)). DuckDB function names apply — `regexp_extract`, `to_timestamp`, `strftime`, `sum`, `percentile_cont`, etc.
+
+**Filter & count**
 
 ```bash
-# Filter by archive state
+# Every unpinned row (remote-only; local bytes evicted)
 hubsync ls | duckql "WHERE archive_state='unpinned'"
 
-# Aggregate
-hubsync ls | duckql "SELECT archive_state, count(*) AS n GROUP BY 1 ORDER BY n DESC"
+# Health check: how many rows in each archive state, with total bytes?
+hubsync ls | duckql "
+  SELECT archive_state,
+         count(*) AS n,
+         round(sum(size)/1e9, 2) AS gb
+  GROUP BY 1 ORDER BY n DESC"
 
-# Paths over 1 MB, sorted desc
-hubsync ls | duckql "SELECT path, size WHERE kind='file' AND size > 1000000 ORDER BY size DESC"
+# Rows still pending the archive worker (NULL or dirty)
+hubsync ls | duckql "
+  SELECT count(*) AS pending,
+         round(sum(size)/1e6, 1) AS mb
+  WHERE archive_state IN ('', 'dirty') AND kind='file'"
+```
 
-# Preview an archive run
-hubsync archive --dry | duckql "SELECT path, size ORDER BY size DESC LIMIT 10"
+**Size & layout**
 
-# Recently archived rows
-hubsync ls | duckql "SELECT path, to_timestamp(archive_uploaded_at/1000) AS at WHERE archive_state='archived' ORDER BY at DESC LIMIT 10"
+```bash
+# Ten biggest files, in MB
+hubsync ls | duckql "
+  SELECT path, round(size/1e6, 1) AS mb
+  WHERE kind='file'
+  ORDER BY size DESC LIMIT 10"
+
+# Bytes by first path segment (one source_id per line in a b2cast-style tree)
+hubsync ls | duckql "
+  SELECT regexp_extract(path, '^([^/]+)', 1) AS prefix,
+         count(*) AS n,
+         round(sum(size)/1e9, 2) AS gb
+  WHERE kind='file'
+  GROUP BY 1 ORDER BY gb DESC"
+
+# Bytes by file extension
+hubsync ls | duckql "
+  SELECT regexp_extract(path, '\.([^./]+)\$', 1) AS ext,
+         count(*) AS n,
+         round(sum(size)/1e9, 2) AS gb
+  WHERE kind='file'
+  GROUP BY 1 ORDER BY gb DESC"
+```
+
+**Time-based**
+
+```bash
+# Upload throughput per minute (reads archive_uploaded_at, which is unix millis)
+hubsync ls | duckql "
+  SELECT strftime(to_timestamp(archive_uploaded_at/1000), '%Y-%m-%d %H:%M') AS minute,
+         count(*) AS uploads,
+         round(sum(size)/1e6, 1) AS mb
+  WHERE archive_state='archived'
+  GROUP BY 1 ORDER BY minute DESC LIMIT 10"
+
+# Ten most recently archived rows
+hubsync ls | duckql "
+  SELECT path,
+         to_timestamp(archive_uploaded_at/1000) AS at
+  WHERE archive_state='archived'
+  ORDER BY archive_uploaded_at DESC LIMIT 10"
+```
+
+**Content-addressed**
+
+```bash
+# Duplicate content: same digest at multiple paths
+hubsync ls | duckql "
+  SELECT digest, count(*) AS n, any_value(path) AS sample_path
+  WHERE kind='file'
+  GROUP BY 1
+  HAVING count(*) > 1
+  ORDER BY n DESC LIMIT 20"
+
+# Find a specific B2 object by its archive_file_id
+hubsync ls | duckql "WHERE archive_file_id LIKE '%f115965cef5a50e90%'"
+```
+
+**Archive preview**
+
+```bash
+# `archive --dry` emits the same row shape, so any of the above queries work
+# against it too — useful for previewing a run before touching B2.
+hubsync archive --dry | duckql "
+  SELECT count(*) AS pending,
+         round(sum(size)/1e9, 2) AS gb"
 ```
 
 ### `hubsync status`
