@@ -109,7 +109,7 @@ func cmdServe(args []string) {
 
 	hc, err := hubContext()
 	if err != nil {
-		log.Fatal(err)
+		fatalf("%v", err)
 	}
 
 	if *dbPath == "" {
@@ -202,7 +202,7 @@ func cmdClient(args []string) {
 
 	hc, err := hubContext()
 	if err != nil {
-		log.Fatal(err)
+		fatalf("%v", err)
 	}
 
 	if *dbPath == "" {
@@ -260,7 +260,7 @@ func cmdPin(args []string, target hubsync.TargetState) {
 
 	hc, err := hubContext()
 	if err != nil {
-		log.Fatal(err)
+		fatalf("%v", err)
 	}
 
 	req := hubsync.PinRequest{Globs: fs.Args(), Dry: *dry}
@@ -362,16 +362,16 @@ func cmdLs(args []string) {
 
 	hc, err := hubContext()
 	if err != nil {
-		log.Fatal(err)
+		fatalf("%v", err)
 	}
 	prefix, err := hc.resolvePrefix(arg)
 	if err != nil {
-		log.Fatalf("ls: %v", err)
+		fatalf("ls: %v", err)
 	}
 
 	store, cleanup, err := openHubStoreRO(hc.root)
 	if err != nil {
-		log.Fatalf("ls: %v", err)
+		fatalf("ls: %v", err)
 	}
 	defer cleanup()
 
@@ -393,7 +393,7 @@ func cmdStatus(args []string) {
 
 	hc, err := hubContext()
 	if err != nil {
-		log.Fatal(err)
+		fatalf("%v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

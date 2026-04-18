@@ -18,17 +18,20 @@ cd cli/hubsync && go build -o hubsync .
 # Scaffold .hubsync/config.toml (optional; only needed for B2 archive)
 ./hubsync init /path/to/files
 
-# Start hub (watches current directory)
-HUBSYNC_TOKEN=secret ./hubsync serve -dir /path/to/files -listen 127.0.0.1:8080
+# Start hub (cd into the hub first — every operational verb walks up
+# from cwd looking for .hubsync/, same way git finds .git/)
+cd /path/to/files
+HUBSYNC_TOKEN=secret hubsync serve -listen 127.0.0.1:8080
 
-# Start read-only client
-HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica
+# Start read-only client (from inside the replica dir)
+cd /path/to/replica
+HUBSYNC_TOKEN=secret hubsync client -hub http://localhost:8080
 
 # Start read-write client (pushes local changes back)
-HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica -mode write
+HUBSYNC_TOKEN=secret hubsync client -hub http://localhost:8080 -mode write
 
 # One-shot sync (bootstrap and/or catch up, then exit)
-HUBSYNC_TOKEN=secret ./hubsync client -hub http://localhost:8080 -dir /path/to/replica -once
+HUBSYNC_TOKEN=secret hubsync client -hub http://localhost:8080 -once
 ```
 
 ## Backblaze B2 archive
@@ -65,25 +68,30 @@ If you'd rather not use env vars, just edit `.hubsync/config.toml` and hard-code
 
 When the config is present, `hubsync serve` starts an archive worker that uploads every file under the hub directory to `<bucket>/<bucket_prefix>`. Each upload stamps `X-Bz-Info-hubsync_digest` + `X-Bz-Info-hubsync_digest_algo` so an operator (or a future `fsck`) can cross-check content.
 
-Operator verbs work with **or without** a running `hubsync serve`:
+Operator verbs work with **or without** a running `hubsync serve`. All
+run from inside the hub tree (walk up to find `.hubsync/`, same as git):
 
 ```bash
-hubsync archive /path/to/dir              # one-shot: scan + upload pending files, then exit
-hubsync archive /path/to/dir --dry        # preview as JSONL; no network, no state change
-hubsync ls                                # virtual listing incl. unpinned entries
-hubsync status                            # tree + archive counts
-hubsync pin   'big.bin'                   # ensure the file is archived + local
-hubsync unpin 'big.bin'                   # ensure it's archived, then evict local
-hubsync unpin '**/*.tmp'  --dry           # show the plan, mutate nothing
+cd /path/to/hub
+hubsync archive                        # one-shot: scan + upload pending files, then exit
+hubsync archive --dry                  # preview as JSONL; no network, no state change
+hubsync ls                             # entries at cwd's level (top-level from hub root)
+hubsync ls sub/                        # entries under sub/, collapsed on "/"
+hubsync ls --all                       # every hub_entry row (old ls default)
+hubsync status                         # tree + archive counts
+hubsync pin   'big.bin'                # ensure the file is archived + local
+hubsync unpin 'big.bin'                # ensure it's archived, then evict local
+hubsync unpin '**/*.tmp'  --dry        # show the plan, mutate nothing
 ```
 
-If `hubsync serve` is listening on `.hubsync/serve.sock`, these verbs RPC
-to it. If it isn't, they run in-process: take an exclusive flock on
-`.hubsync/hub.lock` (so two writers can't race), scan the tree, apply the
-operation, release the lock. `ls` and `status` are read-only and skip the
-lock entirely — they open the DB read-only via SQLite WAL. This makes
-`hubsync archive` usable as a general "back up this tree to B2 and leave"
-tool with no daemon required.
+If `hubsync serve` is listening on `.hubsync/serve.sock`, `archive`,
+`pin`, `unpin`, and `status` RPC to it. If it isn't, they run in-process:
+take an exclusive flock on `.hubsync/hub.lock` (so two writers can't
+race), scan the tree, apply the operation, release the lock. `ls` always
+reads `hub.db` read-only (SQLite WAL permits it alongside a live writer),
+so it never RPCs and never takes the lock. This makes `hubsync archive`
+usable as a general "back up this tree to B2 and leave" tool with no
+daemon required.
 
 **Pin state is a data-fetch concern, not a tree-visibility concern.** Clients still see unpinned rows in `hub_tree`; `GET /blobs/{digest}` on a hub whose local copy is gone transparently returns a 302 to a short-lived presigned B2 URL.
 
@@ -99,40 +107,54 @@ hubsync init [dir]
 
 The scaffolded config references env vars via `${VAR}` interpolation for bucket / prefix / B2 credentials. See "Backblaze B2 archive" above.
 
+### Hub discovery
+
+Every operational verb (`serve`, `client`, `archive`, `archive-gc`, `pin`,
+`unpin`, `ls`, `status`) walks up from cwd looking for `.hubsync/`, the
+same way git finds `.git/`. If none is found in any ancestor, it errors:
+
+```
+hubsync: no .hubsync/ found in cwd or any ancestor.
+```
+
+Path arguments (`ls <path>`, `archive-gc <path>`) resolve cwd-relative
+within the hub. From `<hubroot>/sub/`: `ls foo/` = hub-relative `sub/foo/`;
+`ls ../other/` = `other/`; paths that escape the hub root error out.
+
+`init` is the one exception: it creates a `.hubsync/`, so it still
+accepts an optional `[dir]` positional (default: cwd).
+
 ### `hubsync serve`
 
-Start the hub server.
+Start the hub server. Run from inside the hub tree.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-dir` | `.` | Directory to watch |
 | `-listen` | `127.0.0.1:8080` | HTTP listen address |
-| `-db` | `<dir>/.hubsync/hub.db` | SQLite database path |
+| `-db` | `<hub>/.hubsync/hub.db` | SQLite database path |
 
 ### `hubsync client`
 
-Start a sync client.
+Start a sync client. Run from inside the replica's hub tree.
 
 | Flag | Default | Description |
 |---|---|---|
 | `-hub` | (required) | Hub URL, e.g. `http://localhost:8080` |
-| `-dir` | `.` | Local sync directory |
-| `-db` | `<dir>/.hubsync/client.db` | SQLite database path |
+| `-db` | `<hub>/.hubsync/client.db` | SQLite database path |
 | `-mode` | `read` | `read` or `write` |
 | `-scan-interval` | `5s` | How often to scan for local changes (write mode) |
 | `-once` | `false` | Bootstrap and/or catch up to the hub's current state, then exit (read mode only) |
 
 ### `hubsync archive`
 
-One-shot: walks a hub directory and uploads every pending file to B2, then exits. Complementary to `hubsync serve` — use when you want to back up a static tree (e.g. a build output) without running a daemon.
+One-shot: scans the hub (cwd's `.hubsync/`) and uploads every pending file to B2, then exits. Complementary to `hubsync serve` — use when you want to back up a static tree (e.g. a build output) without running a daemon.
 
 ```
-hubsync archive [dir] [--dry] [--quiet]
+hubsync archive [--dry] [--quiet]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| positional `dir` | `.` | Hub directory (walks up looking for `.hubsync/`) |
 | `--dry` | `false` | Emit JSONL of what would upload; no network, no state change, no B2 credentials required |
 | `--quiet` | `false` | Suppress per-file progress on stderr |
 
@@ -141,10 +163,11 @@ Takes `.hubsync/hub.lock` for the duration, so concurrent runs against the same 
 ```bash
 # Typical usage in a build pipeline
 hubsync init ./dist
-godotenv -f ~/.env.secret hubsync archive ./dist
+cd ./dist
+godotenv -f ~/.env.secret hubsync archive
 
 # Preview before running the real thing
-hubsync archive ./dist --dry | duckql "SELECT state, count(*) GROUP BY 1"
+hubsync archive --dry | duckql "SELECT state, count(*) GROUP BY 1"
 ```
 
 ### `hubsync archive-gc`
@@ -152,14 +175,13 @@ hubsync archive ./dist --dry | duckql "SELECT state, count(*) GROUP BY 1"
 One-shot: lists a B2 prefix and deletes objects that no local `hub_entry` row claims. Useful for retiring orphaned test cruft, saturation-probe bytes, or whole sid/ trees that nobody owns anymore.
 
 ```
-hubsync archive-gc <prefix> [--dry] [-dir DIR]
+hubsync archive-gc [path] [--dry]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| positional `prefix` | (required) | Bucket-relative key prefix. Literal string, not a glob. |
+| positional `path` | `.` | Cwd-relative hub path. The hub's `bucket_prefix` is auto-prepended when composing the B2 list prefix. Not a glob. |
 | `--dry` | `false` | Classify without deleting; emit JSONL of would-be actions. |
-| `-dir` | `.` | Hub directory (walks up looking for `.hubsync/`). Hard error if not found. |
 
 `archive-gc` is a thin wrapper around B2's native list primitive: **one invocation ↔ one delimited list call at the given prefix** (plus a flat sweep per orphan dir we actually delete). Each listed entry is either a real file or a common-prefix "dir" marker, and is classified against `hub_entry`:
 
@@ -179,15 +201,16 @@ Flags must precede the positional (Go's `flag` package stops at the first non-fl
 **Cost note**: B2's Class C list transactions are generously free-tiered (2,500/day). Per-object deletes are Class A (not free) — for large time-based cleanup of whole prefixes (e.g. "everything under `b2cast-test/` older than 14 days"), a B2 bucket-level lifecycle rule is free and strictly cheaper than `archive-gc`. Use `archive-gc` for targeted, claim-aware cleanup; use lifecycle rules for blanket retention policy.
 
 ```bash
-# Preview: what would get deleted under this prefix?
-hubsync archive-gc --dry b2cast-test/2026-04-17/ | duckql \
-  "SELECT action, count(*) FROM stdin GROUP BY 1"
+# Preview top-level entries at the hub's bucket_prefix root.
+cd /path/to/hub
+hubsync archive-gc --dry | duckql "SELECT action, count(*) FROM stdin GROUP BY 1"
 
-# Actually clean up a bucket-side-only orphan prefix the hub never tracked.
-# (Run from inside any hub whose bucket is the same one — the hub's rows all
-# live under its own bucket_prefix, so nothing matches these keys: everything
-# is classified as orphan.)
-hubsync archive-gc b2cast-saturate/2026-04-17/
+# Drill into a specific sid (cwd-relative; bucket_prefix auto-prepended).
+hubsync archive-gc sid123/ --dry
+
+# From inside a sub-dir, `.` means cwd's slice of the bucket.
+cd /path/to/hub/sub
+hubsync archive-gc --dry   # lists <bucket_prefix>sub/
 ```
 
 ### `hubsync pin` / `hubsync unpin`
@@ -196,25 +219,40 @@ Declarative commands; the argument is a doublestar glob, the command is the targ
 
 | Flag | Default | Description |
 |---|---|---|
-| `-dir` | `.` | Hub directory (walks up looking for `.hubsync/`) |
 | `--dry` | `false` | Print the reconciler plan per path; do not mutate |
 
 If `hubsync serve` is running, the verbs RPC to it. Otherwise they run in-process after taking `.hubsync/hub.lock`. Either way `[archive]` must be configured (pin/unpin need the B2 client). `--dry` must precede the glob (Go's `flag` package stops at the first positional).
 
 ### `hubsync ls`
 
-Virtual listing from the hub's registry (including unpinned rows). Follows the shared [`ls` / `duckql` convention](https://github.com/hayeah/dotfiles) — no bespoke filter flags; pipe to `duckql` when you want to filter, sort, or aggregate.
+Listing from the hub's registry (including unpinned rows). By default `ls` shows **one directory level** — cwd's position in the hub, collapsed on `/`. Pass `--all` to dump every row (the old default). Follows the shared [`ls` / `duckql` convention](https://github.com/hayeah/dotfiles) — no bespoke filter flags; pipe to `duckql` when you want to filter, sort, or aggregate.
 
 ```
-hubsync ls [--quiet]
+hubsync ls [path] [--all]
 ```
 
-| Flag | Default | Description |
+| Arg | Default | Description |
 |---|---|---|
-| `-dir` | `.` | Hub directory |
-| `--quiet` | `false` | Suppress warnings on stderr (no-op today — convention placeholder) |
+| positional `path` | `.` | Cwd-relative hub path. `.` (or omitted) = cwd's level. Escaping the hub errors. |
+| `--all` | `false` | Emit every `hub_entry` row regardless of path (pre-prefix behavior). |
 
-Output is **always JSONL**, one row per `hub_entry` row. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
+Output is **always JSONL**, one row per entry. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
+
+`ls` is read-only and never RPCs — it opens `hub.db` directly under SQLite WAL, so it works whether or not `hubsync serve` is running.
+
+**Synthetic dir rows.** When `ls` collapses deeper paths into a single directory entry, it emits a `HubEntry` with `kind = "directory"` and a trailing `/` in `path` (e.g. `{"path":"sub/deeper/","kind":"directory",...}`). Real scanner-materialized dir rows don't carry a trailing slash, so the two are distinguishable in JSONL output.
+
+```bash
+# List top-level from the hub root
+cd /path/to/hub
+hubsync ls
+
+# Drill into a sub-tree (same as running `ls` from inside that sub-dir)
+hubsync ls sub/
+
+# Old full-dump behavior — needed by most duckql queries below
+hubsync ls --all | duckql "SELECT archive_state, count(*) GROUP BY 1"
+```
 
 The wire shape is literally the `HubEntry` Go struct serialized through its JSON tags — no projection type, no synthesis. If a field exists on the struct, it shows up in the output, named after the SQL column it came from:
 
@@ -266,17 +304,17 @@ The output is a plain stream of JSON rows; everything below assumes `duckql` is 
 
 ```bash
 # Every unpinned row (remote-only; local bytes evicted)
-hubsync ls | duckql "WHERE archive_state='unpinned'"
+hubsync ls --all | duckql "WHERE archive_state='unpinned'"
 
 # Health check: how many rows in each archive state, with total bytes?
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT archive_state,
          count(*) AS n,
          round(sum(size)/1e9, 2) AS gb
   GROUP BY 1 ORDER BY n DESC"
 
 # Rows still pending the archive worker (NULL or dirty)
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT count(*) AS pending,
          round(sum(size)/1e6, 1) AS mb
   WHERE archive_state IN ('', 'dirty') AND kind='file'"
@@ -286,13 +324,13 @@ hubsync ls | duckql "
 
 ```bash
 # Ten biggest files, in MB
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT path, round(size/1e6, 1) AS mb
   WHERE kind='file'
   ORDER BY size DESC LIMIT 10"
 
 # Bytes by first path segment (one source_id per line in a b2cast-style tree)
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT regexp_extract(path, '^([^/]+)', 1) AS prefix,
          count(*) AS n,
          round(sum(size)/1e9, 2) AS gb
@@ -300,7 +338,7 @@ hubsync ls | duckql "
   GROUP BY 1 ORDER BY gb DESC"
 
 # Bytes by file extension
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT regexp_extract(path, '\.([^./]+)\$', 1) AS ext,
          count(*) AS n,
          round(sum(size)/1e9, 2) AS gb
@@ -312,7 +350,7 @@ hubsync ls | duckql "
 
 ```bash
 # Upload throughput per minute (reads archive_uploaded_at, which is unix millis)
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT strftime(to_timestamp(archive_uploaded_at/1000), '%Y-%m-%d %H:%M') AS minute,
          count(*) AS uploads,
          round(sum(size)/1e6, 1) AS mb
@@ -320,7 +358,7 @@ hubsync ls | duckql "
   GROUP BY 1 ORDER BY minute DESC LIMIT 10"
 
 # Ten most recently archived rows
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT path,
          to_timestamp(archive_uploaded_at/1000) AS at
   WHERE archive_state='archived'
@@ -331,7 +369,7 @@ hubsync ls | duckql "
 
 ```bash
 # Duplicate content: same digest at multiple paths
-hubsync ls | duckql "
+hubsync ls --all | duckql "
   SELECT digest, count(*) AS n, any_value(path) AS sample_path
   WHERE kind='file'
   GROUP BY 1
@@ -339,7 +377,7 @@ hubsync ls | duckql "
   ORDER BY n DESC LIMIT 20"
 
 # Find a specific B2 object by its archive_file_id
-hubsync ls | duckql "WHERE archive_file_id LIKE '%f115965cef5a50e90%'"
+hubsync ls --all | duckql "WHERE archive_file_id LIKE '%f115965cef5a50e90%'"
 ```
 
 **Archive preview**
@@ -354,11 +392,10 @@ hubsync archive --dry | duckql "
 
 ### `hubsync status`
 
-Grouped archive counts.
+Grouped archive counts. Run from inside the hub tree.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-dir` | `.` | Hub directory |
 | `--json` | `false` | Machine-readable output |
 
 ### Environment Variables

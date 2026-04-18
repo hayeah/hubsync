@@ -151,8 +151,8 @@ func TestCmdLs_FromSubdir_ParentPath(t *testing.T) {
 func TestCmdLs_EscapeHub_Errors(t *testing.T) {
 	dir := seededLsHub(t)
 	_, stderr, code := runCLI(t, dir, nil, "ls", "../../nope")
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for escape")
+	if code != 2 {
+		t.Fatalf("code=%d want 2 (startup failure); stderr=%s", code, stderr)
 	}
 	if !strings.Contains(stderr, "outside the hub root") {
 		t.Errorf("stderr should explain escape: %s", stderr)
@@ -177,8 +177,8 @@ func TestCmdLs_All_DumpsEverything(t *testing.T) {
 func TestCmdLs_NoHubsync_Errors(t *testing.T) {
 	dir := t.TempDir()
 	_, stderr, code := runCLI(t, dir, nil, "ls")
-	if code == 0 {
-		t.Fatalf("expected non-zero exit outside a hub")
+	if code != 2 {
+		t.Fatalf("code=%d want 2 (startup failure); stderr=%s", code, stderr)
 	}
 	if !strings.Contains(stderr, "no .hubsync/") {
 		t.Errorf("stderr should say no .hubsync/: %s", stderr)
