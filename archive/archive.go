@@ -71,7 +71,32 @@ type ArchiveStorage interface {
 	// the hub's credentials. Used by /blobs/{digest} → 302 redirect when
 	// the local file is absent and the row is unpinned.
 	PresignDownloadURL(ctx context.Context, key string, ttl time.Duration) (string, error)
+
+	// ListKeys enumerates objects under prefix. If delimiter is non-empty
+	// (typically "/"), keys that would span the delimiter are collapsed
+	// into common-prefix markers whose Key ends in the delimiter and whose
+	// FileID/Size are zero. If delimiter is "", every object under prefix
+	// is returned flat.
+	ListKeys(ctx context.Context, prefix, delimiter string) ListIterator
+
+	// DeleteByKey removes the head version at key. If wantFileID is
+	// non-empty, the implementation verifies the live head's FileID matches
+	// before issuing the delete and returns a non-nil error (without
+	// deleting) on mismatch. A not-exist key is treated as success.
+	DeleteByKey(ctx context.Context, key, wantFileID string) error
 }
+
+// ListIterator streams ListKeys results. Next advances; Entry returns the
+// current row; Err reports a terminal error (call after Next returns false).
+type ListIterator interface {
+	Next() bool
+	Entry() RemoteInfo
+	Err() error
+}
+
+// ErrFileIDMismatch is returned by DeleteByKey when the live head's FileID
+// does not match the caller's wantFileID. The head is not deleted.
+var ErrFileIDMismatch = errors.New("archive: fileID mismatch")
 
 // Metadata keys used on B2 fileInfo (X-Bz-Info-*).
 const (

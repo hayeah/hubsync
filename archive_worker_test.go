@@ -265,6 +265,12 @@ func (f *failStorage) Download(ctx context.Context, key string, w io.Writer) err
 func (f *failStorage) PresignDownloadURL(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	return f.inner.PresignDownloadURL(ctx, key, ttl)
 }
+func (f *failStorage) ListKeys(ctx context.Context, prefix, delimiter string) archive.ListIterator {
+	return f.inner.ListKeys(ctx, prefix, delimiter)
+}
+func (f *failStorage) DeleteByKey(ctx context.Context, key, wantFileID string) error {
+	return f.inner.DeleteByKey(ctx, key, wantFileID)
+}
 
 func TestArchiveWorkerRunOnce_FailuresAggregated(t *testing.T) {
 	env := newWorkerEnv(t)

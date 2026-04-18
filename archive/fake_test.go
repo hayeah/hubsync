@@ -98,3 +98,84 @@ func TestFakeStoragePresignRequiresUploaded(t *testing.T) {
 		t.Errorf("presign url = %q", got)
 	}
 }
+
+func TestFakeStorageListKeysFlat(t *testing.T) {
+	ctx := context.Background()
+	s := NewFakeStorage()
+	for _, k := range []string{"a/1", "a/2", "b/1", "a/sub/3"} {
+		_, _ = s.Upload(ctx, UploadRequest{Key: k, Source: strings.NewReader("x"), Size: 1})
+	}
+
+	it := s.ListKeys(ctx, "a/", "")
+	var got []string
+	for it.Next() {
+		got = append(got, it.Entry().Key)
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := []string{"a/1", "a/2", "a/sub/3"}
+	if !stringsEqual(got, want) {
+		t.Errorf("flat list = %v, want %v", got, want)
+	}
+}
+
+func TestFakeStorageListKeysDelimiter(t *testing.T) {
+	ctx := context.Background()
+	s := NewFakeStorage()
+	for _, k := range []string{"p/sid1/a", "p/sid1/b", "p/sid2/c", "p/top"} {
+		_, _ = s.Upload(ctx, UploadRequest{Key: k, Source: strings.NewReader("x"), Size: 1})
+	}
+
+	it := s.ListKeys(ctx, "p/", "/")
+	var got []string
+	for it.Next() {
+		got = append(got, it.Entry().Key)
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := []string{"p/sid1/", "p/sid2/", "p/top"}
+	if !stringsEqual(got, want) {
+		t.Errorf("delim list = %v, want %v", got, want)
+	}
+}
+
+func TestFakeStorageDeleteByKey(t *testing.T) {
+	ctx := context.Background()
+	s := NewFakeStorage()
+	info, _ := s.Upload(ctx, UploadRequest{Key: "k", Source: strings.NewReader("x"), Size: 1})
+
+	// wrong fileID → ErrFileIDMismatch, no deletion
+	if err := s.DeleteByKey(ctx, "k", "wrong-id"); !errors.Is(err, ErrFileIDMismatch) {
+		t.Fatalf("want ErrFileIDMismatch, got %v", err)
+	}
+	if s.VersionCount("k") != 1 {
+		t.Fatal("mismatch delete must not remove versions")
+	}
+
+	// correct fileID → success
+	if err := s.DeleteByKey(ctx, "k", info.FileID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if s.VersionCount("k") != 0 {
+		t.Fatal("delete should remove all versions")
+	}
+
+	// not-exist → success (idempotent)
+	if err := s.DeleteByKey(ctx, "k", ""); err != nil {
+		t.Fatalf("delete-missing must be nil, got %v", err)
+	}
+}
+
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
