@@ -200,22 +200,11 @@ func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req Pin
 
 // ---- ls ---------------------------------------------------------------
 
+// LsResponse is the payload for `/rpc/ls` and the no-serve `LocalLs`
+// fallback. Entries are sorted by path; each entry is a HubEntry
+// serialized through its JSON tags (one key per SQL column).
 type LsResponse struct {
-	Entries []LsEntry `json:"entries"`
-}
-
-// LsEntry is one row in the hub's authoritative tree, serialized as JSONL by
-// the CLI (per the `ls` / `duckql` convention). Keys are snake_case, ordered
-// deliberately: `path` is the stable identifier / first key; mtime is RFC3339
-// UTC; optional handles (digest_hex / archive_file_id) omit when empty.
-type LsEntry struct {
-	Path          string `json:"path"`
-	Kind          string `json:"kind"`
-	State         string `json:"state"`
-	Size          int64  `json:"size"`
-	MTime         string `json:"mtime"` // RFC3339 UTC (e.g. "2026-04-17T13:42:05Z")
-	DigestHex     string `json:"digest_hex,omitempty"`
-	ArchiveFileID string `json:"archive_file_id,omitempty"`
+	Entries []HubEntry `json:"entries"`
 }
 
 // LocalLs reads the tree directly from the store and returns the same
@@ -227,25 +216,7 @@ func LocalLs(store *HubStore) (LsResponse, error) {
 		return LsResponse{}, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	out := LsResponse{Entries: make([]LsEntry, 0, len(entries))}
-	for _, e := range entries {
-		out.Entries = append(out.Entries, EntryToLs(e))
-	}
-	return out, nil
-}
-
-// EntryToLs projects a HubEntry onto the wire shape used by `ls` and
-// `archive --dry`.
-func EntryToLs(e HubEntry) LsEntry {
-	return LsEntry{
-		Path:          e.Path,
-		Kind:          fileKindLabel(e.Kind),
-		State:         string(e.ArchiveState),
-		Size:          e.Size,
-		MTime:         time.Unix(e.MTime, 0).UTC().Format(time.RFC3339),
-		DigestHex:     e.Digest.Hex(),
-		ArchiveFileID: e.ArchiveFileID,
-	}
+	return LsResponse{Entries: entries}, nil
 }
 
 func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
@@ -256,19 +227,6 @@ func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
-}
-
-func fileKindLabel(k FileKind) string {
-	switch k {
-	case FileKindFile:
-		return "file"
-	case FileKindDirectory:
-		return "directory"
-	case FileKindSymlink:
-		return "symlink"
-	default:
-		return ""
-	}
 }
 
 // ---- status -----------------------------------------------------------

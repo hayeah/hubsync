@@ -49,19 +49,23 @@ const (
 // HubEntry is a materialized tree row plus archive state. Single owner at a
 // time per column set (scanner owns path/digest/..., archive worker owns the
 // archive_* columns).
+//
+// The JSON tags double as the `hubsync ls` / `archive --dry` wire shape —
+// one JSON key per SQL column, no synthesis. BLOBs marshal as hex via
+// Digest.MarshalJSON; FileKind marshals as its label.
 type HubEntry struct {
-	Path              string
-	Kind              FileKind
-	Digest            Digest
-	Size              int64
-	Mode              uint32
-	MTime             int64
-	Version           int64
-	ArchiveState      ArchiveState
-	ArchiveFileID     string
-	ArchiveSHA1       []byte
-	ArchiveUploadedAt int64
-	UpdatedAt         int64
+	Path              string       `json:"path"`
+	Kind              FileKind     `json:"kind"`
+	Digest            Digest       `json:"digest,omitempty"`
+	Size              int64        `json:"size"`
+	Mode              uint32       `json:"mode"`
+	MTime             int64        `json:"mtime"` // unix seconds
+	Version           int64        `json:"version"`
+	ArchiveState      ArchiveState `json:"archive_state"`
+	ArchiveFileID     string       `json:"archive_file_id,omitempty"`
+	ArchiveSHA1       Digest       `json:"archive_sha1,omitempty"`
+	ArchiveUploadedAt int64        `json:"archive_uploaded_at,omitempty"` // unix millis
+	UpdatedAt         int64        `json:"updated_at"`                    // unix seconds
 }
 
 type hubEntryRow struct {
@@ -102,7 +106,7 @@ func (r hubEntryRow) toEntry() HubEntry {
 	if r.ArchiveFileID.Valid {
 		e.ArchiveFileID = r.ArchiveFileID.String
 	}
-	e.ArchiveSHA1 = r.ArchiveSHA1
+	e.ArchiveSHA1 = Digest(r.ArchiveSHA1)
 	if r.ArchiveUploadedAt.Valid {
 		e.ArchiveUploadedAt = r.ArchiveUploadedAt.Int64
 	}

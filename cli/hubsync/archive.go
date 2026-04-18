@@ -87,17 +87,13 @@ type archiveExit struct {
 
 func (e *archiveExit) Error() string { return fmt.Sprintf("archive exit %d", e.code) }
 
-// runArchiveDry emits pending rows in the shared ls JSONL/table shape.
+// runArchiveDry emits pending rows in the shared ls JSONL shape.
 func runArchiveDry(stack *oneShotStack) error {
 	rows, err := stack.store.PendingArchiveRows()
 	if err != nil {
 		return err
 	}
-	entries := make([]hubsync.LsEntry, 0, len(rows))
-	for _, r := range rows {
-		entries = append(entries, hubsync.EntryToLs(r))
-	}
-	renderLs(os.Stdout, entries)
+	renderLs(os.Stdout, rows)
 	return nil
 }
 

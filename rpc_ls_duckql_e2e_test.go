@@ -11,7 +11,7 @@ import (
 
 // TestLsDuckqlRoundTrip takes the LsResponse JSONL output and pipes it
 // through an actual `duckql` subprocess. This covers the section's required
-// verification: `hubsync ls | duckql "WHERE state='unpinned'"`.
+// verification: `hubsync ls | duckql "WHERE archive_state='unpinned'"`.
 //
 // Skipped gracefully if duckql isn't on PATH (e.g. CI without the tool).
 func TestLsDuckqlRoundTrip(t *testing.T) {
@@ -51,7 +51,7 @@ func TestLsDuckqlRoundTrip(t *testing.T) {
 	t.Logf("hubsync ls (JSONL):\n%s", jsonlBuf.String())
 
 	// Pipe through duckql -o jsonl:- (avoid YAML → simpler to parse).
-	cmd := exec.Command(duckqlBin, "-o", "jsonl:-", "WHERE state='unpinned'")
+	cmd := exec.Command(duckqlBin, "-o", "jsonl:-", "WHERE archive_state='unpinned'")
 	cmd.Stdin = bytes.NewReader(jsonlBuf.Bytes())
 	out, err := cmd.Output()
 	if err != nil {
@@ -60,11 +60,11 @@ func TestLsDuckqlRoundTrip(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	t.Logf("duckql \"WHERE state='unpinned'\" output:\n%s", string(out))
+	t.Logf("duckql \"WHERE archive_state='unpinned'\" output:\n%s", string(out))
 
 	// A second pattern from the spec: aggregate with duckql.
 	cmd2 := exec.Command(duckqlBin, "-o", "jsonl:-",
-		"SELECT state, count(*) AS n GROUP BY 1 ORDER BY n DESC")
+		"SELECT archive_state, count(*) AS n GROUP BY 1 ORDER BY n DESC")
 	cmd2.Stdin = bytes.NewReader(jsonlBuf.Bytes())
 	out2, err := cmd2.Output()
 	if err != nil {
@@ -80,8 +80,8 @@ func TestLsDuckqlRoundTrip(t *testing.T) {
 		t.Fatalf("want 1 unpinned row, got %d:\n%s", len(lines), out)
 	}
 	var r struct {
-		Path  string `json:"path"`
-		State string `json:"state"`
+		Path         string `json:"path"`
+		ArchiveState string `json:"archive_state"`
 	}
 	if err := json.Unmarshal([]byte(lines[0]), &r); err != nil {
 		t.Fatalf("parse duckql output: %v: %s", err, lines[0])
@@ -89,7 +89,7 @@ func TestLsDuckqlRoundTrip(t *testing.T) {
 	if r.Path != "dir/b.txt" {
 		t.Errorf("path=%q want dir/b.txt", r.Path)
 	}
-	if r.State != "unpinned" {
-		t.Errorf("state=%q want unpinned", r.State)
+	if r.ArchiveState != "unpinned" {
+		t.Errorf("archive_state=%q want unpinned", r.ArchiveState)
 	}
 }

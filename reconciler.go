@@ -266,7 +266,7 @@ func (r *Reconciler) Restore(ctx context.Context, path string) error {
 		_ = os.Chmod(tmp.Name(), os.FileMode(entry.Mode))
 	}
 
-	if err := r.Store.MarkArchived(path, entry.ArchiveFileID, entry.ArchiveSHA1, entry.ArchiveUploadedAt); err != nil {
+	if err := r.Store.MarkArchived(path, entry.ArchiveFileID, entry.ArchiveSHA1.Bytes(), entry.ArchiveUploadedAt); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), fullPath); err != nil {

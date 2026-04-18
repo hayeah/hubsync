@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/hayeah/hubsync"
@@ -53,39 +52,17 @@ func fetchStatus(ctx context.Context, hubDir string) (*hubsync.StatusResponse, e
 	return &resp, nil
 }
 
-// renderLs follows the `ls` convention: TTY → human table, pipe → JSONL.
-// Keeps entry order stable (already sorted by path on the server side).
-func renderLs(w io.Writer, entries []hubsync.LsEntry) {
-	if isTerminal(w) {
-		renderLsTable(w, entries)
-		return
-	}
-	renderLsJSONL(w, entries)
-}
-
-func renderLsJSONL(w io.Writer, entries []hubsync.LsEntry) {
+// renderLs emits one JSONL row per entry. TTY vs. pipe doesn't matter —
+// human-readable tables come from piping to `duckql` per the shared
+// `ls` / `duckql` convention. Entry order is stable (sorted by path
+// server-side). Each HubEntry serializes through its JSON tags — no
+// projection struct needed since FileKind and Digest carry their own
+// MarshalJSON.
+func renderLs(w io.Writer, entries []hubsync.HubEntry) {
 	enc := json.NewEncoder(w)
 	for _, e := range entries {
 		_ = enc.Encode(e)
 	}
-}
-
-func renderLsTable(w io.Writer, entries []hubsync.LsEntry) {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PATH\tKIND\tSTATE\tSIZE\tMTIME\tDIGEST")
-	for _, e := range entries {
-		state := e.State
-		if state == "" {
-			state = "-"
-		}
-		digest := e.DigestHex
-		if len(digest) > 12 {
-			digest = digest[:12]
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n",
-			e.Path, e.Kind, state, e.Size, e.MTime, digest)
-	}
-	_ = tw.Flush()
 }
 
 // rpcReachable reports whether a hubsync serve is listening on the hub's
@@ -116,21 +93,6 @@ func openHubStoreRO(hubDir string) (*hubsync.HubStore, func(), error) {
 	}
 	store := &hubsync.HubStore{DB: db}
 	return store, func() { db.Close() }, nil
-}
-
-// isTerminal reports whether w writes to a TTY. Takes io.Writer so tests can
-// pass bytes.Buffer and deterministically get JSONL. Matches the convention
-// in the ls-pattern note: "TTY auto-table" is the only auto-magic.
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // lockHeldMessage formats the "lock held, no serve reachable" error text

@@ -104,23 +104,23 @@ func TestCmdArchive_Dry_EmitsJSONL(t *testing.T) {
 		t.Fatalf("expected 2 JSONL rows, got %d:\n%s", len(lines), stdout)
 	}
 	type row struct {
-		Path      string `json:"path"`
-		Kind      string `json:"kind"`
-		State     string `json:"state"`
-		Size      int64  `json:"size"`
-		MTime     string `json:"mtime"`
-		DigestHex string `json:"digest_hex"`
+		Path         string `json:"path"`
+		Kind         string `json:"kind"`
+		ArchiveState string `json:"archive_state"`
+		Size         int64  `json:"size"`
+		MTime        int64  `json:"mtime"`
+		Digest       string `json:"digest"`
 	}
 	for _, line := range lines {
 		var r row
 		if err := json.Unmarshal([]byte(line), &r); err != nil {
 			t.Fatalf("parse %q: %v", line, err)
 		}
-		if r.Kind != "file" || r.Size == 0 || r.DigestHex == "" {
+		if r.Kind != "file" || r.Size == 0 || r.Digest == "" {
 			t.Errorf("unexpected row: %+v", r)
 		}
-		if r.State != "" {
-			t.Errorf("state=%q want empty (NULL) for fresh dry-run row", r.State)
+		if r.ArchiveState != "" {
+			t.Errorf("archive_state=%q want empty (NULL) for fresh dry-run row", r.ArchiveState)
 		}
 		// Should match ls row shape exactly — no spurious fields.
 	}

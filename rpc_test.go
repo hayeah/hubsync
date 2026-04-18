@@ -68,8 +68,8 @@ func TestRPCPinUnpinLsStatus(t *testing.T) {
 		}
 	}
 
-	// ls should show both as archived, with structured JSONL-friendly
-	// fields: path, kind, state, size, digest_hex, mtime.
+	// ls should show both as archived, with the thin-projection JSONL
+	// fields: path, kind, digest, size, mtime, archive_state, etc.
 	ls, err := client.Ls(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -78,14 +78,14 @@ func TestRPCPinUnpinLsStatus(t *testing.T) {
 		t.Fatalf("ls got %d entries", len(ls.Entries))
 	}
 	for _, e := range ls.Entries {
-		if e.State != "archived" {
-			t.Errorf("%s state=%q", e.Path, e.State)
+		if e.ArchiveState != ArchiveStateArchived {
+			t.Errorf("%s archive_state=%q", e.Path, e.ArchiveState)
 		}
-		if e.Kind != "file" {
-			t.Errorf("%s kind=%q want file", e.Path, e.Kind)
+		if e.Kind != FileKindFile {
+			t.Errorf("%s kind=%v want file", e.Path, e.Kind)
 		}
-		if e.DigestHex == "" {
-			t.Errorf("%s digest_hex is empty", e.Path)
+		if e.Digest.IsZero() {
+			t.Errorf("%s digest is empty", e.Path)
 		}
 		if e.Size == 0 {
 			t.Errorf("%s size is 0", e.Path)

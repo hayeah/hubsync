@@ -5,6 +5,7 @@ package hubsync
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 )
 
@@ -45,6 +46,35 @@ func (d Digest) IsZero() bool { return len(d) == 0 }
 // Size returns the digest's byte length.
 func (d Digest) Size() int { return len(d) }
 
+// MarshalJSON emits the digest as a lowercase hex string (raw bytes
+// would round-trip through JSON's base64 default, which doesn't match
+// how operators read the column in `sqlite3` via `hex(digest)`).
+// Empty digest marshals as `""` so it plays nicely with `omitempty`.
+func (d Digest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Hex())
+}
+
+// UnmarshalJSON accepts a hex-encoded string and stores the raw bytes.
+// Empty string decodes to the zero Digest. Any non-hex input is an
+// error; callers that want to tolerate legacy payloads should
+// pre-validate.
+func (d *Digest) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	if s == "" {
+		*d = ""
+		return nil
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return fmt.Errorf("Digest.UnmarshalJSON: %w", err)
+	}
+	*d = Digest(b)
+	return nil
+}
+
 // SHA256Digest returns the SHA-256 digest of data. Test/fixture helper; in
 // production code paths, use a configured Hasher instead.
 func SHA256Digest(data []byte) Digest {
@@ -67,6 +97,47 @@ const (
 	FileKindDirectory FileKind = 1
 	FileKindSymlink   FileKind = 2
 )
+
+// Label returns the wire-format label for k (`"file"` / `"directory"`
+// / `"symlink"`, or `""` for an unknown int).
+func (k FileKind) Label() string {
+	switch k {
+	case FileKindFile:
+		return "file"
+	case FileKindDirectory:
+		return "directory"
+	case FileKindSymlink:
+		return "symlink"
+	default:
+		return ""
+	}
+}
+
+// MarshalJSON emits the label rather than the raw int — the SQL
+// column is an int enum but every wire consumer reads the label.
+func (k FileKind) MarshalJSON() ([]byte, error) {
+	return json.Marshal(k.Label())
+}
+
+// UnmarshalJSON accepts any of `"file"` / `"directory"` / `"symlink"`.
+// Unknown labels are a decode error.
+func (k *FileKind) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	switch s {
+	case "file":
+		*k = FileKindFile
+	case "directory":
+		*k = FileKindDirectory
+	case "symlink":
+		*k = FileKindSymlink
+	default:
+		return fmt.Errorf("FileKind.UnmarshalJSON: unknown label %q", s)
+	}
+	return nil
+}
 
 // ChangeEntry represents a single mutation in the change log.
 type ChangeEntry struct {
