@@ -2,7 +2,6 @@ package hubsync
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -201,28 +200,11 @@ func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req Pin
 
 // ---- ls ---------------------------------------------------------------
 
+// LsResponse is the payload for `/rpc/ls` and the no-serve `LocalLs`
+// fallback. Entries are sorted by path; each entry is a HubEntry
+// serialized through its JSON tags (one key per SQL column).
 type LsResponse struct {
-	Entries []LsEntry `json:"entries"`
-}
-
-// LsEntry is one hub_entry row serialized for `ls` / `archive --dry`
-// JSONL output. Keys mirror the SQL column names; the projection does
-// no synthesis and no derived columns. Only non-identity transforms:
-// BLOB → hex (for digest / archive_sha1) and FileKind int → label
-// string (for kind). Every other field is pass-through.
-type LsEntry struct {
-	Path              string `json:"path"`
-	Kind              string `json:"kind"`
-	Digest            string `json:"digest,omitempty"`
-	Size              int64  `json:"size"`
-	Mode              uint32 `json:"mode"`
-	MTime             int64  `json:"mtime"` // unix seconds
-	Version           int64  `json:"version"`
-	ArchiveState      string `json:"archive_state"` // "" | "dirty" | "archived" | "unpinned"
-	ArchiveFileID     string `json:"archive_file_id,omitempty"`
-	ArchiveSHA1       string `json:"archive_sha1,omitempty"`
-	ArchiveUploadedAt int64  `json:"archive_uploaded_at,omitempty"` // unix millis (matches MarkArchived)
-	UpdatedAt         int64  `json:"updated_at"`                    // unix seconds
+	Entries []HubEntry `json:"entries"`
 }
 
 // LocalLs reads the tree directly from the store and returns the same
@@ -234,30 +216,7 @@ func LocalLs(store *HubStore) (LsResponse, error) {
 		return LsResponse{}, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	out := LsResponse{Entries: make([]LsEntry, 0, len(entries))}
-	for _, e := range entries {
-		out.Entries = append(out.Entries, EntryToLs(e))
-	}
-	return out, nil
-}
-
-// EntryToLs projects a HubEntry onto the wire shape used by `ls` and
-// `archive --dry`. One-to-one with hub_entry columns.
-func EntryToLs(e HubEntry) LsEntry {
-	return LsEntry{
-		Path:              e.Path,
-		Kind:              fileKindLabel(e.Kind),
-		Digest:            e.Digest.Hex(),
-		Size:              e.Size,
-		Mode:              e.Mode,
-		MTime:             e.MTime,
-		Version:           e.Version,
-		ArchiveState:      string(e.ArchiveState),
-		ArchiveFileID:     e.ArchiveFileID,
-		ArchiveSHA1:       hex.EncodeToString(e.ArchiveSHA1),
-		ArchiveUploadedAt: e.ArchiveUploadedAt,
-		UpdatedAt:         e.UpdatedAt,
-	}
+	return LsResponse{Entries: entries}, nil
 }
 
 func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
@@ -268,19 +227,6 @@ func (s *RPCServer) handleLs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
-}
-
-func fileKindLabel(k FileKind) string {
-	switch k {
-	case FileKindFile:
-		return "file"
-	case FileKindDirectory:
-		return "directory"
-	case FileKindSymlink:
-		return "symlink"
-	default:
-		return ""
-	}
 }
 
 // ---- status -----------------------------------------------------------

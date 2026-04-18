@@ -78,13 +78,13 @@ func TestRPCPinUnpinLsStatus(t *testing.T) {
 		t.Fatalf("ls got %d entries", len(ls.Entries))
 	}
 	for _, e := range ls.Entries {
-		if e.ArchiveState != "archived" {
+		if e.ArchiveState != ArchiveStateArchived {
 			t.Errorf("%s archive_state=%q", e.Path, e.ArchiveState)
 		}
-		if e.Kind != "file" {
-			t.Errorf("%s kind=%q want file", e.Path, e.Kind)
+		if e.Kind != FileKindFile {
+			t.Errorf("%s kind=%v want file", e.Path, e.Kind)
 		}
-		if e.Digest == "" {
+		if e.Digest.IsZero() {
 			t.Errorf("%s digest is empty", e.Path)
 		}
 		if e.Size == 0 {

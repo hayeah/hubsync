@@ -55,8 +55,10 @@ func fetchStatus(ctx context.Context, hubDir string) (*hubsync.StatusResponse, e
 // renderLs emits one JSONL row per entry. TTY vs. pipe doesn't matter —
 // human-readable tables come from piping to `duckql` per the shared
 // `ls` / `duckql` convention. Entry order is stable (sorted by path
-// server-side).
-func renderLs(w io.Writer, entries []hubsync.LsEntry) {
+// server-side). Each HubEntry serializes through its JSON tags — no
+// projection struct needed since FileKind and Digest carry their own
+// MarshalJSON.
+func renderLs(w io.Writer, entries []hubsync.HubEntry) {
 	enc := json.NewEncoder(w)
 	for _, e := range entries {
 		_ = enc.Encode(e)

@@ -173,22 +173,45 @@ hubsync ls [--quiet]
 
 Output is **always JSONL**, one row per `hub_entry` row. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
 
-Row fields — one JSON key per `hub_entry` column, no synthesis:
+The wire shape is literally the `HubEntry` Go struct serialized through its JSON tags — no projection type, no synthesis. If a field exists on the struct, it shows up in the output, named after the SQL column it came from:
 
-| field | SQL column | meaning |
-|---|---|---|
-| `path` | `path` | path relative to the hub root |
-| `kind` | `kind` | `"file"` / `"directory"` / `"symlink"` (from the `kind INTEGER` enum) |
-| `digest` | `digest` | content digest hex (xxh128 or sha256, per `[hub].hash`); omitted when NULL |
-| `size` | `size` | bytes |
-| `mode` | `mode` | POSIX mode bits as a decimal integer |
-| `mtime` | `mtime` | unix seconds |
-| `version` | `version` | change_log version that last touched the row |
-| `archive_state` | `archive_state` | `""` (NULL) / `"dirty"` / `"archived"` / `"unpinned"` |
-| `archive_file_id` | `archive_file_id` | B2 fileId; omitted until the archive worker uploads |
-| `archive_sha1` | `archive_sha1` | B2 contentSha1 hex; omitted until uploaded |
-| `archive_uploaded_at` | `archive_uploaded_at` | unix millis; omitted until uploaded |
-| `updated_at` | `updated_at` | unix seconds; row's last write |
+```go
+type HubEntry struct {
+    Path              string       `json:"path"`
+    Kind              FileKind     `json:"kind"`                          // "file" | "directory" | "symlink"
+    Digest            Digest       `json:"digest,omitempty"`              // hex; omitted when NULL
+    Size              int64        `json:"size"`
+    Mode              uint32       `json:"mode"`                          // POSIX mode bits, decimal
+    MTime             int64        `json:"mtime"`                         // unix seconds
+    Version           int64        `json:"version"`                       // change_log version
+    ArchiveState      ArchiveState `json:"archive_state"`                 // "" | "dirty" | "archived" | "unpinned"
+    ArchiveFileID     string       `json:"archive_file_id,omitempty"`
+    ArchiveSHA1       Digest       `json:"archive_sha1,omitempty"`        // hex; omitted until uploaded
+    ArchiveUploadedAt int64        `json:"archive_uploaded_at,omitempty"` // unix millis
+    UpdatedAt         int64        `json:"updated_at"`                    // unix seconds
+}
+```
+
+`Digest` (used for both `digest` and `archive_sha1`) is a `type Digest string` whose `MarshalJSON` emits lowercase hex — matching `sqlite3`'s `hex(digest)` encoding. `FileKind` is an `int` enum whose `MarshalJSON` emits one of the three labels above.
+
+A sample row:
+
+```json
+{
+  "path": "b9a2f659…/thumbs/thumbs_016.webp",
+  "kind": "file",
+  "digest": "5c3bde711c5da356b4f2502b7d9049fd",
+  "size": 156064,
+  "mode": 420,
+  "mtime": 1776428310,
+  "version": 4929,
+  "archive_state": "archived",
+  "archive_file_id": "4_z72d87f2f15d395a19dd20010_f115965cef5a50e90_…",
+  "archive_sha1": "5b9c5ba240a70ae931c52dd98e3600f5d636b6a3",
+  "archive_uploaded_at": 1776428563163,
+  "updated_at": 1776428563
+}
+```
 
 `hubsync archive --dry` emits the **same** row shape, so any query that works for `ls` works for the dry-run preview.
 
