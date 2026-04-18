@@ -70,7 +70,8 @@ func TestRPCPinUnpinLsStatus(t *testing.T) {
 
 	// ls should show both as archived, with the thin-projection JSONL
 	// fields: path, kind, digest, size, mtime, archive_state, etc.
-	ls, err := client.Ls(ctx)
+	// ls is no longer RPC-served — read the DB directly via LocalLs.
+	ls, err := LocalLs(env.store, LsRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}

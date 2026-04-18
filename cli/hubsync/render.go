@@ -14,27 +14,8 @@ import (
 	"github.com/hayeah/hubsync"
 )
 
-// fetchLs tries the running serve via RPC, falling back to a read-only DB
-// open when the socket isn't reachable. Either path produces the same
-// LsResponse shape.
-func fetchLs(ctx context.Context, hubDir string) (*hubsync.LsResponse, error) {
-	if rpcReachable(hubDir) {
-		c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))
-		return c.Ls(ctx)
-	}
-	store, cleanup, err := openHubStoreRO(hubDir)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-	resp, err := hubsync.LocalLs(store)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-// fetchStatus mirrors fetchLs for the status endpoint.
+// fetchStatus tries the running serve via RPC, falling back to a
+// read-only DB open when the socket isn't reachable.
 func fetchStatus(ctx context.Context, hubDir string) (*hubsync.StatusResponse, error) {
 	if rpcReachable(hubDir) {
 		c := hubsync.NewRPCClient(hubsync.RPCSocketPath(hubDir), os.Getenv("HUBSYNC_TOKEN"))

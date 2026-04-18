@@ -12,9 +12,14 @@ import (
 	"github.com/hayeah/hubsync"
 )
 
-// cmdArchiveGC is the one-shot `hubsync archive-gc <prefix>` verb. It lists
+// cmdArchiveGC is the one-shot `hubsync archive-gc [path]` verb. It lists
 // a B2 prefix one delimiter-level at a time, classifies each entry against
 // hub_entry claims, and (unless --dry) deletes orphans.
+//
+// The path arg is cwd-relative within the hub tree (same semantics as `ls`);
+// the hub's bucket_prefix is automatically prepended when composing the B2
+// list prefix. Bare `archive-gc` or `archive-gc .` lists the bucket_prefix
+// root at cwd's position.
 //
 // Read-only against hub.db (SQLite WAL lets us coexist with a running
 // serve), so it does NOT take the hub lock. Writes to B2 are guarded per-
@@ -24,36 +29,43 @@ import (
 //
 //	0 — success (all orphans deleted, or --dry succeeded).
 //	1 — one or more deletes failed; others were still attempted.
-//	2 — startup failure (no .hubsync, [archive] missing, bad prefix, etc.).
+//	2 — startup failure (no .hubsync, [archive] missing, path escapes hub, etc.).
 func cmdArchiveGC(args []string) {
 	fs := flag.NewFlagSet("archive-gc", flag.ExitOnError)
 	dry := fs.Bool("dry", false, "classify without deleting; emit JSONL of would-be actions")
-	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: hubsync archive-gc <prefix> [--dry] [-dir DIR]\n\nList a B2 prefix and delete objects that no hub_entry row claims.\nPrefix is a literal bucket-relative string (never a glob).\n")
+		fmt.Fprintf(os.Stderr, "usage: hubsync archive-gc [path] [--dry]\n\nList a B2 prefix (cwd-relative inside the hub; bucket_prefix auto-prepended)\nand delete objects that no hub_entry row claims.\n")
 	}
 	fs.Parse(args)
 
-	if fs.NArg() != 1 {
+	arg := "."
+	switch fs.NArg() {
+	case 0:
+	case 1:
+		arg = fs.Arg(0)
+	default:
 		fs.Usage()
 		os.Exit(2)
 	}
-	prefix := fs.Arg(0)
 
-	hubDir, err := locateHubDir(*dir)
+	hc, err := hubContext()
 	if err != nil {
 		fatalf("%v", err)
 	}
+	relPrefix, err := hc.resolvePrefix(arg)
+	if err != nil {
+		fatalf("archive-gc: %v", err)
+	}
 
-	cfg, err := hubsync.LoadConfigFile(hubDir)
+	cfg, err := hubsync.LoadConfigFile(hc.root)
 	if err != nil {
 		fatalf("load config: %v", err)
 	}
 	if cfg.Archive == nil {
-		fatalf("archive not configured — add an [archive] section to %s/.hubsync/config.toml", hubDir)
+		fatalf("archive not configured — add an [archive] section to %s/.hubsync/config.toml", hc.root)
 	}
 
-	store, storeCleanup, err := openHubStoreRO(hubDir)
+	store, storeCleanup, err := openHubStoreRO(hc.root)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -74,8 +86,11 @@ func cmdArchiveGC(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Compose the B2 list prefix: configured bucket_prefix + hub-relative prefix.
+	bucketPrefix := cfg.Archive.BucketPrefix + relPrefix
+
 	enc := json.NewEncoder(os.Stdout)
-	summary, err := gc.Run(ctx, prefix, *dry, func(e hubsync.ArchiveGCEntry) {
+	summary, err := gc.Run(ctx, bucketPrefix, *dry, func(e hubsync.ArchiveGCEntry) {
 		_ = enc.Encode(e)
 	})
 	if err != nil {

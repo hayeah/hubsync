@@ -33,11 +33,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// runCLI runs the built hubsync binary with args + env additions, returning
-// (stdout, stderr, exit).
-func runCLI(t *testing.T, env []string, args ...string) (string, string, int) {
+// runCLI runs the built hubsync binary in cwd with args + env additions,
+// returning (stdout, stderr, exit). Pass "" for cwd to inherit the test
+// runner's cwd.
+func runCLI(t *testing.T, cwd string, env []string, args ...string) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(binPath, args...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
 	cmd.Env = append(os.Environ(), env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -94,7 +98,7 @@ func TestCmdArchive_Dry_EmitsJSONL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, stderr, code := runCLI(t, nil, "archive", "--dry", dir)
+	stdout, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 0 {
 		t.Fatalf("archive --dry: code=%d stderr=%s", code, stderr)
 	}
@@ -141,7 +145,7 @@ func TestCmdArchive_Dry_NoArchiveConfig_Succeeds(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "only.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, code := runCLI(t, nil, "archive", "--dry", dir)
+	stdout, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 0 {
 		t.Fatalf("archive --dry without [archive]: code=%d stderr=%s", code, stderr)
 	}
@@ -151,10 +155,10 @@ func TestCmdArchive_Dry_NoArchiveConfig_Succeeds(t *testing.T) {
 }
 
 func TestCmdArchive_MissingHubsyncDir_Exits2(t *testing.T) {
-	// locateHubDir walks up from cwd; pointing archive at a hub dir that
+	// hubContext walks up from cwd; running archive from a dir that
 	// has no .hubsync anywhere in its ancestry should exit 2.
 	dir := t.TempDir()
-	_, stderr, code := runCLI(t, nil, "archive", "--dry", dir)
+	_, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 2 {
 		t.Fatalf("code=%d want 2; stderr=%s", code, stderr)
 	}
@@ -172,7 +176,7 @@ func TestCmdArchive_LockHeld_Exits2(t *testing.T) {
 	}
 	defer lock.Release()
 
-	_, stderr, code := runCLI(t, nil, "archive", "--dry", dir)
+	_, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 2 {
 		t.Fatalf("code=%d want 2; stderr=%s", code, stderr)
 	}
@@ -188,12 +192,13 @@ func TestCmdLs_NoServe_ReadsDBDirectly(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Populate hub_entry via `archive --dry` (does a FullScan).
-	if _, _, code := runCLI(t, nil, "archive", "--dry", dir); code != 0 {
+	if _, _, code := runCLI(t, dir, nil, "archive", "--dry"); code != 0 {
 		t.Fatalf("pre-populate scan failed")
 	}
 
-	// Now call `ls` — no serve, no lock — should open the DB read-only.
-	stdout, stderr, code := runCLI(t, nil, "ls", "-dir", dir)
+	// Now call `ls --all` — no serve, no lock — should open the DB read-only
+	// and dump every row (new default `ls` lists only cwd's level).
+	stdout, stderr, code := runCLI(t, dir, nil, "ls", "--all")
 	if code != 0 {
 		t.Fatalf("ls: code=%d stderr=%s", code, stderr)
 	}
@@ -209,13 +214,13 @@ func TestCmdPin_NoCreds_CleanError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Populate the DB so the glob has something to match.
-	if _, _, code := runCLI(t, nil, "archive", "--dry", dir); code != 0 {
+	if _, _, code := runCLI(t, dir, nil, "archive", "--dry"); code != 0 {
 		t.Fatalf("pre-populate scan failed")
 	}
 
 	// In-process pin should attempt to open the B2 client and fail. The
 	// error should be readable — not a panic / ErrLocked misreporting.
-	_, stderr, code := runCLI(t, nil, "pin", "-dir", dir, "a.txt")
+	_, stderr, code := runCLI(t, dir, nil, "pin", "a.txt")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit; stderr=%s", stderr)
 	}
@@ -227,7 +232,7 @@ func TestCmdPin_NoCreds_CleanError(t *testing.T) {
 // Smoke: usage with no args should exit non-zero and include 'archive' in
 // the verb list.
 func TestUsage_IncludesArchive(t *testing.T) {
-	_, stderr, code := runCLI(t, nil, "help")
+	_, stderr, code := runCLI(t, "", nil, "help")
 	if code == 0 {
 		t.Errorf("expected non-zero exit for unknown verb")
 	}

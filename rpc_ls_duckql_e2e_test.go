@@ -36,7 +36,7 @@ func TestLsDuckqlRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ls, err := client.Ls(ctx)
+	ls, err := LocalLs(env.store, LsRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}

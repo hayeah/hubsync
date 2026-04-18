@@ -53,19 +53,23 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `hubsync — hub-and-client file sync with B2 archive
 
 Usage:
-  hubsync init     [dir]                      Scaffold .hubsync/config.toml under dir (default: .).
-  hubsync serve    [flags]                    Run the hub (scanner + watcher + archive + RPC).
-  hubsync client   [flags]                    Run a replica (read or write mode).
-  hubsync archive  [dir] [--dry] [--quiet]    One-shot: scan + upload pending files to B2, then exit.
-  hubsync archive-gc <prefix> [--dry]         List a B2 prefix and delete objects no hub_entry claims.
-  hubsync pin      <glob>... [--dry]          Ensure matched paths are archived (remote + local).
-  hubsync unpin    <glob>... [--dry]          Ensure matched paths are unpinned (remote only).
-  hubsync ls       [--quiet]                  List every tree entry (JSONL when piped, table on TTY).
-  hubsync status   [--json]                   Tree + archive counts.
+  hubsync init     [dir]                     Scaffold .hubsync/config.toml under dir (default: .).
+  hubsync serve    [flags]                   Run the hub (scanner + watcher + archive + RPC).
+  hubsync client   [flags]                   Run a replica (read or write mode).
+  hubsync archive  [--dry] [--quiet]         One-shot: scan + upload pending files to B2, then exit.
+  hubsync archive-gc [path] [--dry]          List a B2 prefix (cwd-relative) and delete objects no hub_entry claims.
+  hubsync pin      <glob>... [--dry]         Ensure matched paths are archived (remote + local).
+  hubsync unpin    <glob>... [--dry]         Ensure matched paths are unpinned (remote only).
+  hubsync ls       [path] [--all]            List hub tree entries at path (cwd-relative); --all dumps every row.
+  hubsync status   [--json]                  Tree + archive counts.
 
-'archive', 'pin', 'unpin', 'ls', 'status' work with or without a running
+All operational verbs walk up from cwd to find .hubsync/ — run from anywhere
+inside a hub tree. Path args (ls, archive-gc) are cwd-relative, same as git.
+
+'archive', 'pin', 'unpin', 'status' work with or without a running
 'hubsync serve': if serve is up, they RPC to .hubsync/serve.sock; otherwise
 they run in-process after taking an exclusive flock on .hubsync/hub.lock.
+'ls' always reads hub.db directly (read-only) and never RPCs.
 `)
 }
 
@@ -99,18 +103,17 @@ func cmdInit(args []string) {
 
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dir := fs.String("dir", ".", "directory to watch")
 	listen := fs.String("listen", "127.0.0.1:8080", "listen address")
-	dbPath := fs.String("db", "", "database path (default: <dir>/.hubsync/hub.db)")
+	dbPath := fs.String("db", "", "database path (default: <hub>/.hubsync/hub.db)")
 	fs.Parse(args)
 
-	absDir, err := filepath.Abs(*dir)
+	hc, err := hubContext()
 	if err != nil {
-		log.Fatalf("resolve dir: %v", err)
+		log.Fatal(err)
 	}
 
 	if *dbPath == "" {
-		*dbPath = filepath.Join(absDir, ".hubsync", "hub.db")
+		*dbPath = hubsync.HubDBPath(hc.root)
 	}
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0755); err != nil {
 		log.Fatalf("create db dir: %v", err)
@@ -118,7 +121,7 @@ func cmdServe(args []string) {
 
 	// Exclusive lock — blocks a second serve, or an `archive`/in-process
 	// pin/unpin, from touching this hub while we run.
-	lock, err := hubsync.AcquireHubLock(absDir)
+	lock, err := hubsync.AcquireHubLock(hc.root)
 	if err != nil {
 		log.Fatalf("acquire hub lock: %v", err)
 	}
@@ -126,7 +129,7 @@ func cmdServe(args []string) {
 
 	app, cleanup, err := InitializeHubApp(&hubsync.HubConfig{
 		DBPath:   *dbPath,
-		WatchDir: absDir,
+		WatchDir: hc.root,
 		Token:    os.Getenv("HUBSYNC_TOKEN"),
 		Listen:   *listen,
 	})
@@ -179,8 +182,7 @@ func cmdServe(args []string) {
 func cmdClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	hubURL := fs.String("hub", "", "hub URL (required)")
-	dir := fs.String("dir", ".", "directory to sync to")
-	dbPath := fs.String("db", "", "database path (default: <dir>/.hubsync/client.db)")
+	dbPath := fs.String("db", "", "database path (default: <hub>/.hubsync/client.db)")
 	mode := fs.String("mode", "read", "sync mode: read or write")
 	scanInterval := fs.String("scan-interval", "5s", "scan interval for write mode")
 	once := fs.Bool("once", false, "bootstrap and/or catch up to the hub's current state, then exit")
@@ -198,13 +200,13 @@ func cmdClient(args []string) {
 		log.Fatal("-once is not supported with -mode write")
 	}
 
-	absDir, err := filepath.Abs(*dir)
+	hc, err := hubContext()
 	if err != nil {
-		log.Fatalf("resolve dir: %v", err)
+		log.Fatal(err)
 	}
 
 	if *dbPath == "" {
-		*dbPath = filepath.Join(absDir, ".hubsync", "client.db")
+		*dbPath = filepath.Join(hc.root, ".hubsync", "client.db")
 	}
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0755); err != nil {
 		log.Fatalf("create db dir: %v", err)
@@ -214,7 +216,7 @@ func cmdClient(args []string) {
 		DBPath:       *dbPath,
 		HubURL:       *hubURL,
 		Token:        os.Getenv("HUBSYNC_TOKEN"),
-		SyncDir:      absDir,
+		SyncDir:      hc.root,
 		Mode:         *mode,
 		ScanInterval: *scanInterval,
 	})
@@ -227,14 +229,14 @@ func cmdClient(args []string) {
 	defer cancel()
 
 	if *once {
-		log.Printf("catching up %s from %s", absDir, *hubURL)
+		log.Printf("catching up %s from %s", hc.root, *hubURL)
 		if err := app.Client.Catchup(ctx); err != nil && ctx.Err() == nil {
 			log.Fatalf("catchup error: %v", err)
 		}
 		return
 	}
 
-	log.Printf("starting client in %s mode, syncing to %s", *mode, absDir)
+	log.Printf("starting client in %s mode, syncing to %s", *mode, hc.root)
 
 	if err := app.Client.Sync(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("sync error: %v", err)
@@ -250,14 +252,13 @@ func cmdPin(args []string, target hubsync.TargetState) {
 	}
 	fs := flag.NewFlagSet(verb, flag.ExitOnError)
 	dry := fs.Bool("dry", false, "print the plan; don't mutate anything")
-	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
 	fs.Parse(args)
 	if fs.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "usage: hubsync %s <glob>... [--dry]\n", verb)
 		os.Exit(1)
 	}
 
-	hubDir, err := locateHubDir(*dir)
+	hc, err := hubContext()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -266,7 +267,7 @@ func cmdPin(args []string, target hubsync.TargetState) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	resp, err := runPinOrUnpin(ctx, hubDir, req, target)
+	resp, err := runPinOrUnpin(ctx, hc.root, req, target)
 	if err != nil {
 		log.Fatalf("%s: %v", verb, err)
 	}
@@ -330,30 +331,54 @@ func printPinResults(verb string, resp *hubsync.PinResponse) int {
 // --- ls ------------------------------------------------------------------
 
 // cmdLs follows the shared `ls` / `duckql` convention: no bespoke filter
-// flags (pipe to duckql instead), TTY → human table, pipe → JSONL.
-// Talks to a running serve via RPC when the socket is reachable; otherwise
-// opens the hub DB read-only in-process (SQLite WAL permits this alongside
-// a writer, so it's safe even if serve crashed mid-run).
+// flags (pipe to duckql instead), all output goes through the HubEntry
+// JSONL shape. Always opens hub.db read-only — SQLite WAL permits a
+// reader alongside a live writer, so this is safe even when serve is
+// running. No RPC, no serve.sock probe.
+//
+// Grammar:
+//
+//	hubsync ls                        # list cwd's level in the hub
+//	hubsync ls <path>                 # list <path> resolved relative to cwd
+//	hubsync ls .                      # same as bare ls
+//	hubsync ls --all                  # every hub_entry row (old behavior)
 func cmdLs(args []string) {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
-	quiet := fs.Bool("quiet", false, "suppress warnings on stderr (no effect today)")
+	all := fs.Bool("all", false, "emit every hub_entry row (pre-prefix dump behavior)")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: hubsync ls [path] [--all]\n\nList hub tree entries at a cwd-relative path, collapsed at /.\n--all dumps every hub_entry row regardless of path.\n")
+	}
 	fs.Parse(args)
-	_ = quiet // convention placeholder — no warnings emitted yet
 
-	hubDir, err := locateHubDir(*dir)
+	arg := "."
+	switch fs.NArg() {
+	case 0:
+	case 1:
+		arg = fs.Arg(0)
+	default:
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	hc, err := hubContext()
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	resp, err := fetchLs(ctx, hubDir)
+	prefix, err := hc.resolvePrefix(arg)
 	if err != nil {
 		log.Fatalf("ls: %v", err)
 	}
 
+	store, cleanup, err := openHubStoreRO(hc.root)
+	if err != nil {
+		log.Fatalf("ls: %v", err)
+	}
+	defer cleanup()
+
+	resp, err := hubsync.LocalLs(store, hubsync.LsRequest{Prefix: prefix, All: *all})
+	if err != nil {
+		log.Fatalf("ls: %v", err)
+	}
 	renderLs(os.Stdout, resp.Entries)
 }
 
@@ -364,17 +389,16 @@ func cmdLs(args []string) {
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "JSON output")
-	dir := fs.String("dir", ".", "hub directory (searches up for .hubsync)")
 	fs.Parse(args)
 
-	hubDir, err := locateHubDir(*dir)
+	hc, err := hubContext()
 	if err != nil {
 		log.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, err := fetchStatus(ctx, hubDir)
+	s, err := fetchStatus(ctx, hc.root)
 	if err != nil {
 		log.Fatalf("status: %v", err)
 	}
@@ -389,25 +413,69 @@ func cmdStatus(args []string) {
 	fmt.Printf("null       %6d files   %10d bytes\n", s.Null.Count, s.Null.Bytes)
 }
 
-// --- helpers -------------------------------------------------------------
+// --- hub context / path resolution --------------------------------------
 
-// locateHubDir walks up from start looking for a directory containing
-// .hubsync/. Returns the first match, or start itself if .hubsync exists
-// there.
-func locateHubDir(start string) (string, error) {
-	abs, err := filepath.Abs(start)
+// hubCtx carries the hub root + the hub-relative cwd (empty at root,
+// "sub/" one level down, etc.). Captured once at process start; used by
+// every verb that needs to resolve cwd-relative path args.
+type hubCtx struct {
+	root   string // absolute path to the hub root
+	relCwd string // "" at root, "sub/" one level down
+}
+
+// hubContext walks up from cwd looking for .hubsync/. Returns the hub
+// root and the cwd's position within it. Errors with a single canonical
+// message if no hub is found in cwd or any ancestor.
+func hubContext() (hubCtx, error) {
+	cwd, err := os.Getwd()
 	if err != nil {
-		return "", err
+		return hubCtx{}, err
 	}
-	dir := abs
+	absCwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return hubCtx{}, err
+	}
+	dir := absCwd
 	for {
-		if st, err := os.Stat(filepath.Join(dir, ".hubsync")); err == nil && st.IsDir() {
-			return dir, nil
+		if st, statErr := os.Stat(filepath.Join(dir, ".hubsync")); statErr == nil && st.IsDir() {
+			rel, relErr := filepath.Rel(dir, absCwd)
+			if relErr != nil {
+				return hubCtx{}, relErr
+			}
+			if rel == "." {
+				rel = ""
+			} else {
+				rel = filepath.ToSlash(rel) + "/"
+			}
+			return hubCtx{root: dir, relCwd: rel}, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("no .hubsync directory found at or above %s", abs)
+			return hubCtx{}, fmt.Errorf("no .hubsync/ found in cwd or any ancestor.")
 		}
 		dir = parent
 	}
+}
+
+// resolvePrefix turns a cwd-relative CLI arg into a hub-relative dir-
+// prefix ("" at root, "foo/bar/" otherwise). Paths are joined onto the
+// hub-relative cwd, same as git's cwd-relative path semantics.
+// Errors if the resolved path escapes the hub root.
+func (c hubCtx) resolvePrefix(arg string) (string, error) {
+	if arg == "" || arg == "." {
+		return c.relCwd, nil
+	}
+	abs := filepath.Join(c.root, c.relCwd, arg)
+	rel, err := filepath.Rel(c.root, abs)
+	if err != nil {
+		return "", err
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("%s is outside the hub root (%s)", arg, c.root)
+	}
+	if rel == "." {
+		return "", nil
+	}
+	return rel + "/", nil
 }
