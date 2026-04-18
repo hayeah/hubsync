@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Backblaze/blazer/b2"
@@ -144,6 +145,103 @@ func toRemoteInfo(key, fileID string, a *b2.Attrs) RemoteInfo {
 		}
 	}
 	return out
+}
+
+// ListKeys wraps blazer's bucket.List iterator. When delimiter is non-empty,
+// B2 collapses keys at that separator and emits common-prefix markers whose
+// Name ends in the delimiter; we surface those with RemoteInfo.Key set and
+// everything else zero.
+//
+// Page size: blazer's ListPageSize is hard-capped at 1000 per call
+// (iterator.go:94) even though B2's raw API supports up to 10000. We pass
+// the max blazer allows; realistic prefixes fit in O(tens) of list calls,
+// well inside B2's Class C free tier. Revisit only if a specific prefix
+// ever makes listing cost material.
+func (s *B2Storage) ListKeys(ctx context.Context, prefix, delimiter string) ListIterator {
+	opts := []b2.ListOption{
+		b2.ListPrefix(prefix),
+		b2.ListPageSize(1000),
+	}
+	if delimiter != "" {
+		opts = append(opts, b2.ListDelimiter(delimiter))
+	}
+	return &b2Iterator{
+		ctx:       ctx,
+		inner:     s.bucket.List(ctx, opts...),
+		delimiter: delimiter,
+	}
+}
+
+// DeleteByKey removes the head version at key via blazer's Object.Delete.
+// Object.Delete internally calls ensure(), which HEADs the key to resolve
+// the live FileID; we piggy-back that HEAD and compare against wantFileID
+// before issuing the delete, so the guard adds zero extra API calls.
+func (s *B2Storage) DeleteByKey(ctx context.Context, key, wantFileID string) error {
+	obj := s.bucket.Object(key)
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		if b2.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("archive/b2: delete-head %q: %w", key, err)
+	}
+	_ = attrs // blazer populates obj.ID() from the ensure/Attrs pair
+	if wantFileID != "" && obj.ID() != wantFileID {
+		return fmt.Errorf("%w: key=%s want=%s got=%s", ErrFileIDMismatch, key, wantFileID, obj.ID())
+	}
+	if err := obj.Delete(ctx); err != nil {
+		if b2.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("archive/b2: delete %q: %w", key, err)
+	}
+	return nil
+}
+
+type b2Iterator struct {
+	ctx       context.Context
+	inner     *b2.ObjectIterator
+	delimiter string
+	cur       RemoteInfo
+	primed    bool
+}
+
+func (it *b2Iterator) Next() bool {
+	if !it.inner.Next() {
+		return false
+	}
+	obj := it.inner.Object()
+	name := obj.Name()
+	// Common-prefix markers: blazer returns a pseudo-object whose name ends
+	// in the delimiter. Their Attrs are synthetic; don't call Attrs on them.
+	if it.delimiter != "" && strings.HasSuffix(name, it.delimiter) {
+		it.cur = RemoteInfo{Key: name}
+		it.primed = true
+		return true
+	}
+	attrs, err := obj.Attrs(it.ctx)
+	if err != nil {
+		// Surface via Err().
+		it.inner = nil
+		return false
+	}
+	it.cur = toRemoteInfo(name, obj.ID(), attrs)
+	it.primed = true
+	return true
+}
+
+func (it *b2Iterator) Entry() RemoteInfo {
+	if !it.primed {
+		return RemoteInfo{}
+	}
+	return it.cur
+}
+
+func (it *b2Iterator) Err() error {
+	if it.inner == nil {
+		return fmt.Errorf("archive/b2: list iteration failed")
+	}
+	return it.inner.Err()
 }
 
 // Compile-time interface check.
