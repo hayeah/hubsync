@@ -173,19 +173,20 @@ func (r *Runner[T]) drain(ctx context.Context, opts RunOptions) error {
 	return nil
 }
 
-// feedQueue streams unfinished rows into the queue until the work queue
-// is empty for a full pass. A "pass" is one SELECT; between passes we
-// wait briefly so workers can surface new failures before we re-scan.
+// feedQueue re-scans the work queue in passes until no new row is
+// eligible. Dedup is by (id, attempts): we only emit a row again once
+// its attempts counter has bumped (i.e. a previous attempt completed
+// and terminal-wrote 'failed'). This both prevents double-queuing
+// while workers are still running an attempt AND allows in-Execute
+// retries for failed rows with attempts<max.
 func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<- map[string]any) error {
 	where := r.workQueueWhere(opts)
 	query := fmt.Sprintf(
 		`SELECT * FROM items JOIN tasks USING (id) WHERE %s ORDER BY id`,
 		where,
 	)
+	seen := map[string]int64{}
 
-	// One pass: emit every currently-eligible row. The claim UPDATE
-	// inside processRow re-checks the lease; if another worker got there
-	// first the row is skipped silently.
 	for {
 		rows, err := r.db.QueryContext(ctx, query)
 		if err != nil {
@@ -212,6 +213,12 @@ func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<-
 			for i, name := range cols {
 				row[name] = raw[i]
 			}
+			id, _ := row["id"].(string)
+			attempts := asInt64FromAny(row["attempts"])
+			if prev, ok := seen[id]; ok && attempts <= prev {
+				continue
+			}
+			seen[id] = attempts
 			select {
 			case queue <- row:
 				emitted++
@@ -229,14 +236,32 @@ func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<-
 		if emitted == 0 {
 			return nil
 		}
-		// Let workers drain this batch before we re-scan for newly
-		// freed stale-running rows / retries. This is a soft barrier —
-		// we don't block; we just re-scan after a short delay.
 		select {
 		case <-time.After(100 * time.Millisecond):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+}
+
+// asInt64FromAny coerces a DuckDB row column value into int64 for the
+// attempts field. DuckDB returns INTEGER as int32 via the go driver.
+func asInt64FromAny(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int32:
+		return int64(x)
+	case int:
+		return int64(x)
+	case uint32:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	case float64:
+		return int64(x)
+	default:
+		return 0
 	}
 }
 

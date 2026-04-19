@@ -73,8 +73,9 @@ run from inside the hub tree (walk up to find `.hubsync/`, same as git):
 
 ```bash
 cd /path/to/hub
-hubsync archive                        # one-shot: scan + upload pending files, then exit
-hubsync archive --dry                  # preview as JSONL; no network, no state change
+hubsync archive                        # plan-if-empty + drain the DuckDB task queue
+hubsync archive --dry                  # plan only; inspect .hubsync/archive.duckdb
+hubsync archive --where "path LIKE '%.mov'"  # subset via SQL fragment
 hubsync ls                             # entries at cwd's level (top-level from hub root)
 hubsync ls sub/                        # entries under sub/, collapsed on "/"
 hubsync ls --all                       # every hub_entry row (old ls default)
@@ -147,28 +148,46 @@ Start a sync client. Run from inside the replica's hub tree.
 
 ### `hubsync archive`
 
-One-shot: scans the hub (cwd's `.hubsync/`) and uploads every pending file to B2, then exits. Complementary to `hubsync serve` — use when you want to back up a static tree (e.g. a build output) without running a daemon.
+One-shot: plans (if needed) and uploads every pending file to B2 via a DuckDB-backed task queue. Subset runs, restart-after-crash, and stale-worker reclaim are all native — each invocation is the same operation (plan-if-empty then drain), distinguished only by the state of the DB file and the user's `--where`.
 
 ```
-hubsync archive [--dry] [--quiet]
+hubsync archive [--resume PATH] [--dry] [--where "SQL"] [--workers N] [--max-attempts N] [--stale D] [--heartbeat D]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dry` | `false` | Emit JSONL of what would upload; no network, no state change, no B2 credentials required |
-| `--quiet` | `false` | Suppress per-file progress on stderr |
+| `--resume` | `<hub>/.hubsync/archive.duckdb` | Path to the DuckDB task-state file. The file IS the artifact — every invocation plans-if-empty then drains the work queue against it. |
+| `--dry` | `false` | Plan-if-empty, populate `items` + `tasks`, then exit without uploading. Equivalent to `--where "false"`. |
+| `--where` | `""` | SQL fragment AND-combined with the work-queue predicate. Runs against columns of `items ⋈ tasks` (unqualified names; state columns — `status`, `attempts`, `heartbeat_at`, `error`, `meta` — are reserved). |
+| `--workers` | `runtime.NumCPU()` | Concurrent upload workers. Workers claim distinct rows from the queue via a conditional UPDATE. |
+| `--max-attempts` | `3` | Retry ceiling. A `failed` row with `attempts < max` is re-eligible on the next claim pass. |
+| `--stale` | `30s` | Running-row heartbeat staleness threshold. A `running` row with `heartbeat_at < now() - stale` is reclaimed as if pending. |
+| `--heartbeat` | `5s` | Interval at which workers refresh `heartbeat_at` on their claimed row. |
 
-Takes `.hubsync/hub.lock` for the duration, so concurrent runs against the same hub fail fast with a clear error. Exit codes: `0` = all uploaded (or nothing to do, or `--dry` succeeded); `1` = at least one upload failed (others still attempted); `2` = startup failure (no `.hubsync`, missing `[archive]`, lock held, etc.).
+Takes `.hubsync/hub.lock` for the duration, so concurrent runs against the same hub fail fast with a clear error. Exit codes: `0` = queue drained clean; `1` = at least one `failed` row remains or a runtime error occurred; `2` = startup failure (no `.hubsync`, missing `[archive]`, lock held, etc.).
+
+The task handler is idempotent: before uploading, the worker heads the remote key, and if the stamped `hubsync_digest` matches the local one, it stamps the archive state without re-uploading. This keeps re-runs (after a stale-reclaim, say) from producing duplicate B2 versions.
 
 ```bash
-# Typical usage in a build pipeline
-hubsync init ./dist
-cd ./dist
+# Full run (default, picks up wherever a prior invocation left off)
 godotenv -f ~/.env.secret hubsync archive
 
-# Preview before running the real thing
-hubsync archive --dry | duckql "SELECT state, count(*) GROUP BY 1"
+# Plan only — populates items/tasks so you can inspect with duckdb
+hubsync archive --dry
+duckdb .hubsync/archive.duckdb "FROM items JOIN tasks USING (id) WHERE status='pending' SELECT path, size"
+
+# Subset by items column
+hubsync archive --where "path LIKE '%.mov'"
+
+# Subset by tasks state
+hubsync archive --where "attempts = 0"   # only never-tried
+hubsync archive --where "status = 'failed'"  # retry failed
+
+# Ad-hoc state snapshot
+duckdb .hubsync/archive.duckdb "FROM tasks SELECT status, count(*) GROUP BY 1"
 ```
+
+**Re-planning.** The runner plans once — the first invocation populates `items` from `PendingArchiveRows()`. Subsequent invocations resume against that plan. If the on-disk tree has changed and you want to pick up new files, delete `.hubsync/archive.duckdb` (a `--replan` flag is a deferred follow-up).
 
 ### `hubsync archive-gc`
 
