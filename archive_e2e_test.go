@@ -230,7 +230,10 @@ func TestArchiveOneShot_EndToEnd(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2}); err != nil {
+	// KeepDB: archive-on-success would close the handle; this test's
+	// second-Execute-on-same-runner idempotency check below needs the
+	// DB to stay open.
+	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2, KeepDB: true}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if b, _ := fake.Bytes("oneshot/a.txt"); string(b) != "alpha" {
@@ -245,7 +248,7 @@ func TestArchiveOneShot_EndToEnd(t *testing.T) {
 	// versions land.
 	beforeA := fake.VersionCount("oneshot/a.txt")
 	beforeB := fake.VersionCount("oneshot/b.txt")
-	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2}); err != nil {
+	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2, KeepDB: true}); err != nil {
 		t.Fatal(err)
 	}
 	if n := fake.VersionCount("oneshot/a.txt"); n != beforeA {
