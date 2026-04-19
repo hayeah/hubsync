@@ -56,7 +56,7 @@ Usage:
   hubsync init     [dir]                     Scaffold .hubsync/config.toml under dir (default: .).
   hubsync serve    [flags]                   Run the hub (scanner + watcher + archive + RPC).
   hubsync client   [flags]                   Run a replica (read or write mode).
-  hubsync archive  [--dry] [--quiet]         One-shot: scan + upload pending files to B2, then exit.
+  hubsync archive  [--resume PATH] [--dry] [--where SQL] [--workers N]  Plan + upload pending files; state in .hubsync/archive.duckdb.
   hubsync archive-gc [path] [--dry]          List a B2 prefix (cwd-relative) and delete objects no hub_entry claims.
   hubsync pin      <glob>... [--dry]         Ensure matched paths are archived (remote + local).
   hubsync unpin    <glob>... [--dry]         Ensure matched paths are unpinned (remote only).

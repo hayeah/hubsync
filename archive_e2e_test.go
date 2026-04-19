@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hayeah/hubsync/archive"
+	"github.com/hayeah/hubsync/internal/taskrunner"
 )
 
 // TestArchiveE2E_HubClientArchiveCoexist drives hub + scanner + watcher +
@@ -166,11 +167,11 @@ func TestArchiveE2E_HubClientArchiveCoexist(t *testing.T) {
 }
 
 // TestArchiveOneShot_EndToEnd mirrors the `hubsync archive` flow at the
-// library level: take the hub lock, construct the worker by hand (same as
-// oneShotStack does in cli/hubsync/oneshot.go), run FullScan + RunOnce,
-// check the fake bucket has both files. The CLI binary-level test in
-// cli/hubsync/archive_test.go already covers --dry; this one fills in the
-// upload path without needing live B2.
+// library level: take the hub lock, wire the taskrunner + ArchiveTask
+// (same as cli/hubsync/archive.go), FullScan and Execute, check the fake
+// bucket has both files. CLI-binary-level coverage lives in
+// cli/hubsync/archive_test.go; this test exercises the upload path
+// without needing live B2.
 func TestArchiveOneShot_EndToEnd(t *testing.T) {
 	hubDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(hubDir, ".hubsync"), 0755); err != nil {
@@ -205,23 +206,32 @@ func TestArchiveOneShot_EndToEnd(t *testing.T) {
 	hub := NewHub(store, scanner, nil, bc, hasher)
 
 	fake := archive.NewFakeStorage()
-	worker := &ArchiveWorker{
-		Store: store, Storage: fake, Hasher: hasher,
-		HubDir: hubDir, Prefix: "oneshot/", Workers: 2,
-	}
 
 	if err := hub.FullScan(); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	result, err := worker.RunOnce(ctx, nil)
-	if err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	deps := ArchiveTaskDeps{
+		Store:   store,
+		Storage: fake,
+		Hasher:  hasher,
+		HubDir:  hubDir,
+		Prefix:  "oneshot/",
 	}
-	if len(result.Uploaded) != 2 || len(result.Failed) != 0 {
-		t.Fatalf("result=%+v", result)
+	runner, err := taskrunner.New(taskrunner.Config[*ArchiveTask]{
+		DBPath: filepath.Join(hubDir, ".hubsync", "archive.duckdb"),
+		Plan:   PlanArchiveTasks(deps),
+		Decode: DecodeArchiveTask(deps),
+	})
+	if err != nil {
+		t.Fatalf("taskrunner: %v", err)
+	}
+	defer runner.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2}); err != nil {
+		t.Fatalf("execute: %v", err)
 	}
 	if b, _ := fake.Bytes("oneshot/a.txt"); string(b) != "alpha" {
 		t.Errorf("remote a.txt=%q", b)
@@ -230,12 +240,18 @@ func TestArchiveOneShot_EndToEnd(t *testing.T) {
 		t.Errorf("remote b.txt=%q", b)
 	}
 
-	// Idempotent rerun: no uploads, no failures.
-	result2, err := worker.RunOnce(ctx, nil)
-	if err != nil {
+	// Idempotent rerun: the items table is already populated, all
+	// tasks are 'done'. Second Execute is a no-op — no new fake-storage
+	// versions land.
+	beforeA := fake.VersionCount("oneshot/a.txt")
+	beforeB := fake.VersionCount("oneshot/b.txt")
+	if err := runner.Execute(ctx, taskrunner.RunOptions{Workers: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if len(result2.Uploaded)+len(result2.Failed) != 0 {
-		t.Errorf("second RunOnce not idempotent: %+v", result2)
+	if n := fake.VersionCount("oneshot/a.txt"); n != beforeA {
+		t.Errorf("second Execute bumped a.txt version count: %d → %d", beforeA, n)
+	}
+	if n := fake.VersionCount("oneshot/b.txt"); n != beforeB {
+		t.Errorf("second Execute bumped b.txt version count: %d → %d", beforeB, n)
 	}
 }
