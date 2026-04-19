@@ -124,7 +124,7 @@ func (g *ArchiveGC) collectClaims() (*claimSet, error) {
 		if r.Kind != FileKindFile {
 			continue
 		}
-		key := g.Prefix + r.Path
+		key := archive.JoinKey(g.Prefix, r.Path)
 		cs.fileKeys[key] = struct{}{}
 		cs.paths = append(cs.paths, r.Path)
 	}

@@ -41,7 +41,7 @@ func archiveOne(ctx context.Context, deps ArchiveTaskDeps, path string) (any, er
 		return map[string]any{"skipped": string(entry.ArchiveState)}, nil
 	}
 
-	key := deps.Prefix + path
+	key := archive.JoinKey(deps.Prefix, path)
 
 	if head, err := deps.Storage.HeadByKey(ctx, key); err == nil {
 		if headMatches(head, entry.Digest.Bytes(), deps.Hasher.Name()) {

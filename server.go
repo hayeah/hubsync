@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
+
+	"github.com/hayeah/hubsync/archive"
 )
 
 // Server serves the hub's HTTP API.
@@ -207,7 +209,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	url, err := s.storage.PresignDownloadURL(r.Context(), s.prefix+path, s.blobTTL)
+	url, err := s.storage.PresignDownloadURL(r.Context(), archive.JoinKey(s.prefix, path), s.blobTTL)
 	if err != nil {
 		log.Printf("presign %s: %v", path, err)
 		http.Error(w, "presign failed", http.StatusBadGateway)

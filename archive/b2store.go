@@ -53,7 +53,7 @@ func NewB2Storage(ctx context.Context, cfg B2Config) (*B2Storage, func(), error)
 // Exposed so the reconciler can form the same key when inserting into
 // hub_entry.archive_file_id and when calling the storage.
 func (s *B2Storage) KeyFor(relPath string) string {
-	return s.prefix + relPath
+	return JoinKey(s.prefix, relPath)
 }
 
 func (s *B2Storage) Upload(ctx context.Context, req UploadRequest) (RemoteInfo, error) {

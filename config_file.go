@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -97,8 +96,6 @@ func LoadConfigFile(hubDir string) (*ConfigFile, error) {
 		cf.Archive.B2AppKey = os.ExpandEnv(cf.Archive.B2AppKey)
 		if cf.Archive.BucketPrefix == "" {
 			cf.Archive.BucketPrefix = filepath.Base(hubDir) + "/"
-		} else if !strings.HasSuffix(cf.Archive.BucketPrefix, "/") {
-			cf.Archive.BucketPrefix += "/"
 		}
 	}
 	if err := cf.validate(); err != nil {

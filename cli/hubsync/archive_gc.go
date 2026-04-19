@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/hayeah/hubsync"
+	"github.com/hayeah/hubsync/archive"
 )
 
 // cmdArchiveGC is the one-shot `hubsync archive-gc [path]` verb. It lists
@@ -87,7 +88,7 @@ func cmdArchiveGC(args []string) {
 	defer cancel()
 
 	// Compose the B2 list prefix: configured bucket_prefix + hub-relative prefix.
-	bucketPrefix := cfg.Archive.BucketPrefix + relPrefix
+	bucketPrefix := archive.JoinKey(cfg.Archive.BucketPrefix, relPrefix)
 
 	enc := json.NewEncoder(os.Stdout)
 	summary, err := gc.Run(ctx, bucketPrefix, *dry, func(e hubsync.ArchiveGCEntry) {

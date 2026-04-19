@@ -153,7 +153,7 @@ func (r *Reconciler) Archive(ctx context.Context, path string) error {
 	defer src.Close()
 
 	info, err := r.Storage.Upload(ctx, archive.UploadRequest{
-		Key:        r.Prefix + path,
+		Key:        archive.JoinKey(r.Prefix, path),
 		Size:       entry.Size,
 		Source:     src,
 		Digest:     entry.Digest.Bytes(),
@@ -183,7 +183,7 @@ func (r *Reconciler) Evict(ctx context.Context, path string) error {
 		return fmt.Errorf("evict: %q is in state %q; need 'archived'", path, entry.ArchiveState)
 	}
 
-	key := r.Prefix + path
+	key := archive.JoinKey(r.Prefix, path)
 	head, err := r.Storage.HeadByKey(ctx, key)
 	if err != nil {
 		return fmt.Errorf("evict head-check %s: %w", key, err)
@@ -249,7 +249,7 @@ func (r *Reconciler) Restore(ctx context.Context, path string) error {
 
 	h := r.Hasher.New()
 	mw := io.MultiWriter(tmp, h)
-	if err := r.Storage.Download(ctx, r.Prefix+path, mw); err != nil {
+	if err := r.Storage.Download(ctx, archive.JoinKey(r.Prefix, path), mw); err != nil {
 		return err
 	}
 	gotDigest := Digest(h.Sum(nil))
