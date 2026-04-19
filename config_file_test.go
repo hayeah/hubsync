@@ -130,6 +130,29 @@ bucket_prefix = "custom/"
 	}
 }
 
+func TestLoadConfigFile_BucketPrefixAppendsTrailingSlash(t *testing.T) {
+	os.Unsetenv("HUBSYNC_BUCKET_PREFIX")
+
+	hubDir := t.TempDir()
+	writeConfig(t, hubDir, `
+[hub]
+hash = "xxh128"
+
+[archive]
+provider      = "b2"
+bucket        = "my-bucket"
+bucket_prefix = "no-trailing-slash"
+`)
+
+	cf, err := LoadConfigFile(hubDir)
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	if got, want := cf.Archive.BucketPrefix, "no-trailing-slash/"; got != want {
+		t.Errorf("bucket_prefix: got %q, want %q", got, want)
+	}
+}
+
 func writeConfig(t *testing.T, hubDir, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(hubDir, ".hubsync"), 0755); err != nil {
