@@ -2,13 +2,9 @@ package hubsync
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/hayeah/hubsync/archive"
 )
@@ -126,51 +122,19 @@ func (w *ArchiveWorker) enqueuePending(ctx context.Context, queue chan<- string)
 	return nil
 }
 
-// uploadOne uploads a single file, verifies it, and flips the row to archived.
-// Idempotent: if the row is no longer dirty (e.g. someone else archived it
-// already) the function returns without error.
+// uploadOne uploads a single file, verifies it, and flips the row to
+// archived. Delegates to archiveOne so the watch path shares the
+// taskrunner path's idempotency contract — including the head-match
+// short-circuit that prevents B2 version stacking when a previous
+// upload crashed before MarkArchived. The (any, error) skip metadata
+// from archiveOne is discarded; only success/failure matters here.
 func (w *ArchiveWorker) uploadOne(ctx context.Context, path string) error {
-	entry, ok, err := w.Store.EntryLookup(path)
-	if err != nil {
-		return err
-	}
-	if !ok || entry.Kind != FileKindFile {
-		return nil
-	}
-	switch entry.ArchiveState {
-	case ArchiveStateArchived, ArchiveStateUnpinned:
-		return nil
-	}
-
-	fullPath := filepath.Join(w.HubDir, path)
-	src, err := os.Open(fullPath)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", fullPath, err)
-	}
-	defer src.Close()
-
-	// blazer computes B2's content SHA-1 internally (single-part: buffered
-	// hash; large-file: per-part + large_file_sha1). We trust entry.Digest
-	// as the scanner-computed content hash for hubsync_digest; the in-place-
-	// rewrite mitigation (stream-hash during upload and verify) lands later.
-	key := w.Prefix + path
-	info, err := w.Storage.Upload(ctx, archive.UploadRequest{
-		Key:        key,
-		Size:       entry.Size,
-		Source:     src,
-		Digest:     entry.Digest.Bytes(),
-		DigestAlgo: w.Hasher.Name(),
-		MTime:      time.Unix(entry.MTime, 0),
-	})
-	if err != nil {
-		return err
-	}
-
-	var sha1Bytes []byte
-	if info.ContentSHA1 != "" {
-		if b, err := hex.DecodeString(info.ContentSHA1); err == nil {
-			sha1Bytes = b
-		}
-	}
-	return w.Store.MarkArchived(path, info.FileID, sha1Bytes, info.UploadedAt.UnixMilli())
+	_, err := archiveOne(ctx, ArchiveTaskDeps{
+		Store:   w.Store,
+		Storage: w.Storage,
+		Hasher:  w.Hasher,
+		HubDir:  w.HubDir,
+		Prefix:  w.Prefix,
+	}, path)
+	return err
 }
