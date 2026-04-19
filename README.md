@@ -151,18 +151,19 @@ Start a sync client. Run from inside the replica's hub tree.
 One-shot: plans (if needed) and uploads every pending file to B2 via a DuckDB-backed task queue. Subset runs, restart-after-crash, and stale-worker reclaim are all native — each invocation is the same operation (plan-if-empty then drain), distinguished only by the state of the DB file and the user's `--where`.
 
 ```
-hubsync archive [--resume PATH] [--dry] [--where "SQL"] [--workers N] [--max-attempts N] [--stale D] [--heartbeat D]
+hubsync archive [--resume PATH] [--dry] [--where "SQL"] [--workers N] [--max-attempts N] [--stale D] [--heartbeat D] [--keep-db]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--resume` | `<hub>/.hubsync/archive.duckdb` | Path to the DuckDB task-state file. The file IS the artifact — every invocation plans-if-empty then drains the work queue against it. |
+| `--resume` | `<hub>/.hubsync/archive.duckdb` | Path to the task-state file. The file IS the artifact — every invocation plans-if-empty then drains the work queue against it. |
 | `--dry` | `false` | Plan-if-empty, populate `items` + `tasks`, then exit without uploading. Equivalent to `--where "false"`. |
 | `--where` | `""` | SQL fragment AND-combined with the work-queue predicate. Runs against columns of `items ⋈ tasks` (unqualified names; state columns — `status`, `attempts`, `heartbeat_at`, `error`, `meta` — are reserved). |
 | `--workers` | `runtime.NumCPU()` | Concurrent upload workers. Workers claim distinct rows from the queue via a conditional UPDATE. |
 | `--max-attempts` | `3` | Retry ceiling. A `failed` row with `attempts < max` is re-eligible on the next claim pass. |
 | `--stale` | `30s` | Running-row heartbeat staleness threshold. A `running` row with `heartbeat_at < now() - stale` is reclaimed as if pending. |
 | `--heartbeat` | `5s` | Interval at which workers refresh `heartbeat_at` on their claimed row. |
+| `--keep-db` | `false` | Disable archive-on-success. With this flag set, a fully-drained state DB stays at `--resume`; the default renames it with a UTC timestamp prefix so the next invocation plans fresh. |
 
 Takes `.hubsync/hub.lock` for the duration, so concurrent runs against the same hub fail fast with a clear error. Exit codes: `0` = queue drained clean; `1` = at least one `failed` row remains or a runtime error occurred; `2` = startup failure (no `.hubsync`, missing `[archive]`, lock held, etc.).
 
@@ -187,7 +188,9 @@ hubsync archive --where "status = 'failed'"  # retry failed
 duckdb .hubsync/archive.duckdb "FROM tasks SELECT status, count(*) GROUP BY 1"
 ```
 
-**Re-planning.** The runner plans once — the first invocation populates `items` from `PendingArchiveRows()`. Subsequent invocations resume against that plan. If the on-disk tree has changed and you want to pick up new files, delete `.hubsync/archive.duckdb` (a `--replan` flag is a deferred follow-up).
+**Re-planning.** The runner plans once — the first invocation populates `items` from `PendingArchiveRows()`. Subsequent invocations resume against that plan.
+
+**Archive on success.** When a run drains the queue cleanly (zero `pending` / `running` / `failed` rows), the state DB is renamed in place with a UTC timestamp prefix, e.g. `.hubsync/archive.duckdb` → `.hubsync/2026-04-19T143522Z-archive.duckdb`. The next `hubsync archive` at the canonical path finds no DB and plans from scratch, so a "nothing to do" second run produces a fresh "N done" line instead of the confusing "0 done, 0 pending" that looks like the tool is stuck. The archived files are preserved as-is — use them for audit or delete them at your leisure. Pass `--keep-db` to opt out and preserve same-path resume semantics. You can also recover by moving one of the archived DBs back onto the canonical path.
 
 ### `hubsync archive-gc`
 

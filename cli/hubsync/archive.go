@@ -45,6 +45,7 @@ func cmdArchive(args []string) {
 	maxAttempts := fs.Int("max-attempts", 3, "retry ceiling for failed tasks")
 	stale := fs.Duration("stale", 30*time.Second, "heartbeat staleness threshold for stale-running reclaim")
 	heartbeat := fs.Duration("heartbeat", 5*time.Second, "heartbeat interval")
+	keepDB := fs.Bool("keep-db", false, "do not rename the state DB after a successful drain (default: archive it in place with a UTC timestamp prefix)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `usage: hubsync archive [--resume <path>] [--dry] [--where "<sql>"] [--workers N]
 
@@ -123,19 +124,20 @@ Examples:
 		Stale:          *stale,
 		HeartbeatEvery: *heartbeat,
 		Dry:            *dry,
+		KeepDB:         *keepDB,
 	}
 	if err := runner.Execute(ctx, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "archive: %v\n", err)
 		os.Exit(1)
 	}
 
-	summary, err := summarizeTasks(runner)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "archive: summary: %v\n", err)
-		os.Exit(1)
+	s := runner.Summary()
+	fmt.Fprintf(os.Stderr, "archive: %d done, %d pending, %d running, %d failed\n",
+		s.Done, s.Pending, s.Running, s.Failed)
+	if archived := runner.ArchivedPath(); archived != "" {
+		fmt.Fprintf(os.Stderr, "archive: archived task DB -> %s\n", archived)
 	}
-	fmt.Fprintln(os.Stderr, summary)
-	if hasFailed(runner) {
+	if s.Failed > 0 {
 		os.Exit(1)
 	}
 }
@@ -149,25 +151,3 @@ func archivePrefix(s *oneShotStack) string {
 	return s.config.Archive.BucketPrefix
 }
 
-// summarizeTasks returns a one-line summary of the tasks table state.
-func summarizeTasks(r *taskrunner.Runner[*hubsync.ArchiveTask]) (string, error) {
-	var pending, running, done, failed int
-	err := r.DB().QueryRow(
-		`SELECT
-		   COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN status='running' THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN status='done'    THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END), 0)
-		 FROM tasks`).Scan(&pending, &running, &done, &failed)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("archive: %d done, %d pending, %d running, %d failed",
-		done, pending, running, failed), nil
-}
-
-func hasFailed(r *taskrunner.Runner[*hubsync.ArchiveTask]) bool {
-	var n int
-	_ = r.DB().QueryRow(`SELECT COUNT(*) FROM tasks WHERE status='failed'`).Scan(&n)
-	return n > 0
-}

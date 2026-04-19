@@ -83,7 +83,9 @@ func TestExecute_PlanAndDrain(t *testing.T) {
 	defer r.Close()
 
 	ctx := context.Background()
-	if err := r.Execute(ctx, RunOptions{Workers: 2, HeartbeatEvery: 50 * time.Millisecond}); err != nil {
+	// KeepDB: archive-on-success would close the handle, breaking the
+	// second-Execute-on-same-runner assertion below.
+	if err := r.Execute(ctx, RunOptions{Workers: 2, HeartbeatEvery: 50 * time.Millisecond, KeepDB: true}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 
@@ -95,7 +97,7 @@ func TestExecute_PlanAndDrain(t *testing.T) {
 	}
 
 	// Second Execute on the same DB: everything is done, no-op.
-	if err := r.Execute(ctx, RunOptions{Workers: 2}); err != nil {
+	if err := r.Execute(ctx, RunOptions{Workers: 2, KeepDB: true}); err != nil {
 		t.Fatalf("execute (second): %v", err)
 	}
 	ranMu.Lock()
@@ -265,11 +267,7 @@ func TestExecute_RetryOnFailure(t *testing.T) {
 		t.Fatalf("a should have run 2 times (fail-once + retry), got %d; ran=%v", aRuns, ran)
 	}
 
-	var done int
-	if err := r.DB().QueryRow(`SELECT COUNT(*) FROM tasks WHERE status='done'`).Scan(&done); err != nil {
-		t.Fatal(err)
-	}
-	if done != 2 {
+	if done := r.Summary().Done; done != 2 {
 		t.Fatalf("expected 2 done, got %d", done)
 	}
 }
