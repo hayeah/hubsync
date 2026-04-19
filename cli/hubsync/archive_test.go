@@ -225,6 +225,71 @@ func TestCmdArchive_LockHeld_Exits2(t *testing.T) {
 	}
 }
 
+// TestCmdArchive_Resume_SecondPassIsNoOp exercises the core invariant of
+// the task-runner pattern: running `hubsync archive` twice with the same
+// --resume path must not re-do the uploads. Uses --dry so no real B2 is
+// involved; after the first pass all items are 'pending', second pass is
+// still a no-op because --dry never claims / runs anything.
+//
+// The meaningful "second pass is no-op" check on live uploads lives in
+// TestArchiveOneShot_EndToEnd (library-level) — it verifies via
+// FakeStorage.VersionCount that no duplicate uploads land.
+func TestCmdArchive_Resume_SecondPassIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	seedHub(t, dir, true)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("beta"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, stderr, code := runCLI(t, dir, nil, "archive", "--dry"); code != 0 {
+		t.Fatalf("first archive: code=%d stderr=%s", code, stderr)
+	}
+	dbPath := filepath.Join(dir, ".hubsync", "archive.duckdb")
+	firstItems := queryArchiveItems(t, dbPath)
+	firstPending := queryTaskCount(t, dbPath, "pending")
+	if len(firstItems) != 2 || firstPending != 2 {
+		t.Fatalf("first pass unexpected: items=%d pending=%d", len(firstItems), firstPending)
+	}
+
+	// Second pass: items already populated, --dry → no plan, no run.
+	if _, stderr, code := runCLI(t, dir, nil, "archive", "--dry"); code != 0 {
+		t.Fatalf("second archive: code=%d stderr=%s", code, stderr)
+	}
+	if n := len(queryArchiveItems(t, dbPath)); n != 2 {
+		t.Errorf("items count changed on second pass: %d", n)
+	}
+	if n := queryTaskCount(t, dbPath, "pending"); n != 2 {
+		t.Errorf("pending count changed on second pass: %d", n)
+	}
+}
+
+// TestCmdArchive_WhereSubset_Filters confirms --where is plumbed
+// through. With --dry the predicate doesn't actually run anything, but
+// we can verify the DB exists and items were populated (the --where
+// applies only to the work-queue SELECT, not to planning).
+func TestCmdArchive_WhereSubset_AppliesToWorkQueue(t *testing.T) {
+	dir := t.TempDir()
+	seedHub(t, dir, true)
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// --where with --dry is a no-op (still no run); still exercises flag parsing.
+	_, stderr, code := runCLI(t, dir, nil, "archive", "--dry", "--where", "path = 'one.txt'")
+	if code != 0 {
+		t.Fatalf("archive --dry --where: code=%d stderr=%s", code, stderr)
+	}
+	// All three should be in items regardless of --where (plan always runs).
+	dbPath := filepath.Join(dir, ".hubsync", "archive.duckdb")
+	if n := len(queryArchiveItems(t, dbPath)); n != 3 {
+		t.Errorf("expected 3 items after plan, got %d", n)
+	}
+}
+
 func TestCmdLs_NoServe_ReadsDBDirectly(t *testing.T) {
 	dir := t.TempDir()
 	seedHub(t, dir, true)
