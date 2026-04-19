@@ -3,18 +3,21 @@ module github.com/hayeah/hubsync
 go 1.25.0
 
 require (
+	github.com/Backblaze/blazer v0.7.2
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/wire v0.7.0
 	github.com/hayeah/go-lstree v0.0.0-20260406054537-e7de701b7076
 	github.com/jmoiron/sqlx v1.4.0
+	github.com/marcboeker/go-duckdb/v2 v2.4.3
+	github.com/pelletier/go-toml/v2 v2.3.0
+	github.com/zeebo/xxh3 v1.1.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.48.1
 )
 
 require (
-	github.com/Backblaze/blazer v0.7.2 // indirect
 	github.com/apache/arrow-go/v18 v18.4.1 // indirect
-	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.1.21 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-amd64 v0.1.21 // indirect
@@ -35,13 +38,10 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/marcboeker/go-duckdb/arrowmapping v0.0.21 // indirect
 	github.com/marcboeker/go-duckdb/mapping v0.0.21 // indirect
-	github.com/marcboeker/go-duckdb/v2 v2.4.3 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/pelletier/go-toml/v2 v2.3.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.50.0 // indirect

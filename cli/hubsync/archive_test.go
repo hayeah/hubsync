@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hayeah/hubsync"
+	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
 // binPath is set by TestMain — one `go build` per test run.
@@ -85,7 +86,7 @@ b2_app_key    = "dummy"
 	}
 }
 
-func TestCmdArchive_Dry_EmitsJSONL(t *testing.T) {
+func TestCmdArchive_Dry_PopulatesItems(t *testing.T) {
 	dir := t.TempDir()
 	seedHub(t, dir, true) // [archive] present but creds bogus — --dry doesn't open B2
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha"), 0644); err != nil {
@@ -98,42 +99,34 @@ func TestCmdArchive_Dry_EmitsJSONL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
+	_, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 0 {
 		t.Fatalf("archive --dry: code=%d stderr=%s", code, stderr)
 	}
 
-	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 JSONL rows, got %d:\n%s", len(lines), stdout)
+	dbPath := filepath.Join(dir, ".hubsync", "archive.duckdb")
+	items := queryArchiveItems(t, dbPath)
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d: %v", len(items), items)
 	}
-	type row struct {
-		Path         string `json:"path"`
-		Kind         string `json:"kind"`
-		ArchiveState string `json:"archive_state"`
-		Size         int64  `json:"size"`
-		MTime        int64  `json:"mtime"`
-		Digest       string `json:"digest"`
-	}
-	for _, line := range lines {
-		var r row
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			t.Fatalf("parse %q: %v", line, err)
+	wantPaths := map[string]bool{"a.txt": true, "sub/b.txt": true}
+	for _, it := range items {
+		if !wantPaths[it.Path] {
+			t.Errorf("unexpected path: %s", it.Path)
 		}
-		if r.Kind != "file" || r.Size == 0 || r.Digest == "" {
-			t.Errorf("unexpected row: %+v", r)
+		if it.Size == 0 || it.DigestHex == "" {
+			t.Errorf("unexpected row: %+v", it)
 		}
-		if r.ArchiveState != "" {
-			t.Errorf("archive_state=%q want empty (NULL) for fresh dry-run row", r.ArchiveState)
-		}
-		// Should match ls row shape exactly — no spurious fields.
 	}
 
-	// The row order should be lexicographic by path: a.txt, sub/b.txt.
-	var first row
-	_ = json.Unmarshal([]byte(lines[0]), &first)
-	if first.Path != "a.txt" {
-		t.Errorf("first row path=%q want a.txt", first.Path)
+	// All tasks should be pending after --dry.
+	pending := queryTaskCount(t, dbPath, "pending")
+	if pending != 2 {
+		t.Fatalf("pending=%d want 2", pending)
+	}
+	done := queryTaskCount(t, dbPath, "done")
+	if done != 0 {
+		t.Fatalf("done=%d want 0 after --dry", done)
 	}
 }
 
@@ -145,13 +138,60 @@ func TestCmdArchive_Dry_NoArchiveConfig_Succeeds(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "only.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
+	_, stderr, code := runCLI(t, dir, nil, "archive", "--dry")
 	if code != 0 {
 		t.Fatalf("archive --dry without [archive]: code=%d stderr=%s", code, stderr)
 	}
-	if !strings.Contains(stdout, `"path":"only.txt"`) {
-		t.Errorf("stdout missing only.txt row: %s", stdout)
+	dbPath := filepath.Join(dir, ".hubsync", "archive.duckdb")
+	items := queryArchiveItems(t, dbPath)
+	if len(items) != 1 || items[0].Path != "only.txt" {
+		t.Errorf("items=%v want [only.txt]", items)
 	}
+}
+
+type archiveItem struct {
+	Path      string
+	Size      int64
+	DigestHex string
+}
+
+// queryArchiveItems reads the items table from the task-runner DuckDB file.
+func queryArchiveItems(t *testing.T, dbPath string) []archiveItem {
+	t.Helper()
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbPath, err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT path, size, digest FROM items ORDER BY path`)
+	if err != nil {
+		t.Fatalf("query items: %v", err)
+	}
+	defer rows.Close()
+	var out []archiveItem
+	for rows.Next() {
+		var it archiveItem
+		if err := rows.Scan(&it.Path, &it.Size, &it.DigestHex); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// queryTaskCount returns the number of tasks rows in the given status.
+func queryTaskCount(t *testing.T, dbPath, status string) int {
+	t.Helper()
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbPath, err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status = ?`, status).Scan(&n); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	return n
 }
 
 func TestCmdArchive_MissingHubsyncDir_Exits2(t *testing.T) {

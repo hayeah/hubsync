@@ -18,14 +18,13 @@ import (
 // run). Cleanup releases both the DB and the archive storage in reverse
 // construction order.
 type oneShotStack struct {
-	hubDir        string
-	config        *hubsync.ConfigFile
-	store         *hubsync.HubStore
-	hasher        hubsync.Hasher
-	hub           *hubsync.Hub
-	storage       archive.ArchiveStorage
-	reconciler    *hubsync.Reconciler
-	archiveWorker *hubsync.ArchiveWorker
+	hubDir     string
+	config     *hubsync.ConfigFile
+	store      *hubsync.HubStore
+	hasher     hubsync.Hasher
+	hub        *hubsync.Hub
+	storage    archive.ArchiveStorage
+	reconciler *hubsync.Reconciler
 
 	cleanups []func()
 }
@@ -96,21 +95,12 @@ func newOneShotStack(hubDir string, needArchive bool) (*oneShotStack, error) {
 		s.cleanups = append(s.cleanups, storageCleanup)
 
 		prefix := cfg.Archive.BucketPrefix
-		workers := cfg.Archive.ArchiveWorkers
 		s.reconciler = &hubsync.Reconciler{
 			Store:   store,
 			Storage: storage,
 			Hasher:  hasher,
 			HubDir:  hubDir,
 			Prefix:  prefix,
-		}
-		s.archiveWorker = &hubsync.ArchiveWorker{
-			Store:   store,
-			Storage: storage,
-			Hasher:  hasher,
-			HubDir:  hubDir,
-			Prefix:  prefix,
-			Workers: workers,
 		}
 	}
 	return s, nil
