@@ -188,52 +188,26 @@ func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<-
 	seen := map[string]int64{}
 
 	for {
-		rows, err := r.db.QueryContext(ctx, query)
+		// Materialize one batch fully before emitting. We hold exactly
+		// one DuckDB connection (MaxOpenConns=1); if we pushed into the
+		// bounded queue while still iterating rows, the conn would stay
+		// pinned, workers would block on claim UPDATEs that need the
+		// same conn, and the channel would back-pressure forever. Read
+		// → Close → emit sidesteps the deadlock.
+		batch, err := r.fetchBatch(ctx, query, seen)
 		if err != nil {
-			return fmt.Errorf("taskrunner: select work queue: %w", err)
-		}
-		cols, err := rows.Columns()
-		if err != nil {
-			rows.Close()
-			return fmt.Errorf("taskrunner: columns: %w", err)
+			return err
 		}
 
-		emitted := 0
-		for rows.Next() {
-			raw := make([]any, len(cols))
-			ptrs := make([]any, len(cols))
-			for i := range raw {
-				ptrs[i] = &raw[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				rows.Close()
-				return fmt.Errorf("taskrunner: scan: %w", err)
-			}
-			row := make(map[string]any, len(cols))
-			for i, name := range cols {
-				row[name] = raw[i]
-			}
-			id, _ := row["id"].(string)
-			attempts := asInt64FromAny(row["attempts"])
-			if prev, ok := seen[id]; ok && attempts <= prev {
-				continue
-			}
-			seen[id] = attempts
+		for _, row := range batch {
 			select {
 			case queue <- row:
-				emitted++
 			case <-ctx.Done():
-				rows.Close()
 				return ctx.Err()
 			}
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("taskrunner: iterate: %w", err)
-		}
-		rows.Close()
 
-		if emitted == 0 {
+		if len(batch) == 0 {
 			return nil
 		}
 		select {
@@ -242,6 +216,50 @@ func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<-
 			return ctx.Err()
 		}
 	}
+}
+
+// fetchBatch runs one work-queue select and returns the rows that passed
+// the (id, attempts) dedup. The DuckDB conn is released before return,
+// so callers are free to push into a bounded channel without risking
+// starving the claim UPDATEs.
+func (r *Runner[T]) fetchBatch(ctx context.Context, query string, seen map[string]int64) ([]map[string]any, error) {
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: select work queue: %w", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: columns: %w", err)
+	}
+
+	var batch []map[string]any
+	for rows.Next() {
+		raw := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range raw {
+			ptrs[i] = &raw[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("taskrunner: scan: %w", err)
+		}
+		row := make(map[string]any, len(cols))
+		for i, name := range cols {
+			row[name] = raw[i]
+		}
+		id, _ := row["id"].(string)
+		attempts := asInt64FromAny(row["attempts"])
+		if prev, ok := seen[id]; ok && attempts <= prev {
+			continue
+		}
+		seen[id] = attempts
+		batch = append(batch, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("taskrunner: iterate: %w", err)
+	}
+	return batch, nil
 }
 
 // asInt64FromAny coerces a DuckDB row column value into int64 for the

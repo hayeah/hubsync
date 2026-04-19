@@ -360,3 +360,64 @@ func TestExecute_ConcurrentWorkers(t *testing.T) {
 		t.Fatalf("decoder not invoked once per row: %d", counter)
 	}
 }
+
+// TestExecute_FeedBackpressureDoesNotDeadlock is the regression test
+// for the bug where feedQueue pinned the single DuckDB connection via
+// the rows iterator while pushing into a bounded channel — the first
+// claim UPDATE blocked on the conn, the channel back-pressured, and
+// the whole pipeline hung. With N rows > workers*(buffer+1), the
+// deadlock reliably triggers against the pre-fix feedQueue.
+func TestExecute_FeedBackpressureDoesNotDeadlock(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "backpressure.duckdb")
+
+	const N = 40
+	var ran []string
+	var ranMu sync.Mutex
+
+	cfg := Config[*echoTask]{
+		DBPath: dbPath,
+		Plan: func(ctx context.Context, emit func(*echoTask)) error {
+			for i := 0; i < N; i++ {
+				emit(&echoTask{ID: fmt.Sprintf("t%03d", i)})
+			}
+			return nil
+		},
+		Decode: func(row map[string]any) (*echoTask, error) {
+			id, _ := row["id"].(string)
+			return &echoTask{
+				ID:    id,
+				ran:   &ran,
+				ranMu: &ranMu,
+				sleep: 2 * time.Millisecond,
+			}, nil
+		},
+	}
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// 2 workers → channel buffer = 4 → in-flight capacity = 6.
+	// With N=40, feedQueue MUST release the DuckDB conn before
+	// blocking on the channel, or the claim path starves.
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Execute(context.Background(), RunOptions{Workers: 2})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Execute deadlocked: did not finish within 10s for N=40 rows, 2 workers")
+	}
+
+	ranMu.Lock()
+	defer ranMu.Unlock()
+	if len(ran) != N {
+		t.Fatalf("expected %d runs, got %d", N, len(ran))
+	}
+}
