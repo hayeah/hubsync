@@ -2,7 +2,6 @@ package taskrunner
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"os"
@@ -27,6 +26,7 @@ func Main[T Task](cfg Config[T]) {
 	maxAttempts := fs.Int("max-attempts", 3, "retry ceiling for failed rows")
 	stale := fs.Duration("stale", 30*time.Second, "running-row heartbeat staleness threshold")
 	heartbeat := fs.Duration("heartbeat", 5*time.Second, "heartbeat / Status() poll interval")
+	keepDB := fs.Bool("keep-db", false, "do not rename the DB file after a successful drain (default: archive in place)")
 	_ = fs.Parse(os.Args[1:])
 
 	if *resume == "" {
@@ -56,25 +56,15 @@ func Main[T Task](cfg Config[T]) {
 		Stale:          *stale,
 		HeartbeatEvery: *heartbeat,
 		Dry:            *dry,
+		KeepDB:         *keepDB,
 	}
 	if err := r.Execute(ctx, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "task: %v\n", err)
 		os.Exit(1)
 	}
 
-	failed, err := countFailed(r.DB())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "task: count failed: %v\n", err)
-		os.Exit(1)
-	}
-	if failed > 0 {
+	if failed := r.Summary().Failed; failed > 0 {
 		fmt.Fprintf(os.Stderr, "task: %d failed row(s) remain\n", failed)
 		os.Exit(1)
 	}
-}
-
-func countFailed(db *sql.DB) (int, error) {
-	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status='failed'`).Scan(&n)
-	return n, err
 }

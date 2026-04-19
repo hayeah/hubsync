@@ -48,6 +48,14 @@ type RunOptions struct {
 	Stale          time.Duration // default 30s
 	HeartbeatEvery time.Duration // default 5s
 	Dry            bool          // plan-if-empty, don't run
+
+	// KeepDB disables the default archive-on-success behavior. When false
+	// (the default) and Execute drains the queue cleanly with zero
+	// remaining pending/failed/running rows, the DB file is closed and
+	// renamed in place with a UTC ISO-8601 timestamp prefix so the next
+	// invocation at the canonical path plans from scratch. Set KeepDB
+	// to preserve same-path resume semantics.
+	KeepDB bool
 }
 
 // Runner owns the DB handle and serialized-write mutex.
@@ -63,6 +71,32 @@ type Runner[T Task] struct {
 
 	// planErr captures the first error seen during the emit callback.
 	planErr error
+
+	// closed guards against double-close after archive-on-success already
+	// closed the handle — callers still run `defer r.Close()` and would
+	// otherwise hit the driver's closed-database error.
+	closed bool
+
+	// archivedPath is set by archiveIfDrained after a successful rename.
+	// "" means no archive happened (KeepDB, in-memory DB, or queue not
+	// fully drained).
+	archivedPath string
+
+	// summary is the last-observed snapshot of the tasks table, captured
+	// at the end of Execute (after drain, before any archive-induced
+	// close). Callers that want to log a one-line status or exit non-
+	// zero on residual failures read it via Summary().
+	summary Summary
+}
+
+// Summary is a snapshot of the tasks table grouped by status. Populated
+// at the end of Execute; read via Runner.Summary(). Zero-valued on
+// Runners that haven't Execute'd yet.
+type Summary struct {
+	Pending int
+	Running int
+	Done    int
+	Failed  int
 }
 
 // New opens the SQLite database in WAL mode and ensures the tasks/runs
@@ -99,8 +133,27 @@ func sqliteDSN(path string) string {
 	return "file:" + path + "?" + pragmas
 }
 
-// Close releases the DB handle.
-func (r *Runner[T]) Close() error { return r.db.Close() }
+// Close releases the DB handle. Idempotent: calling Close twice (the
+// second time via the caller's `defer r.Close()` after archive-on-success
+// already closed) is a no-op.
+func (r *Runner[T]) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	return r.db.Close()
+}
+
+// ArchivedPath returns the destination path of the archived DB if
+// Execute's drain completed with an empty queue and KeepDB was false.
+// Returns "" when no archive happened (KeepDB, in-memory DB, remaining
+// work, or a concurrent process won the rename race).
+func (r *Runner[T]) ArchivedPath() string { return r.archivedPath }
+
+// Summary returns the last-observed tasks-table snapshot captured at
+// the end of Execute. Safe to call after archive-on-success has closed
+// the underlying DB handle.
+func (r *Runner[T]) Summary() Summary { return r.summary }
 
 // Execute is the one-verb operation: plan-if-needed, select unfinished
 // rows (+ user --where), and drain them through a worker pool.
@@ -121,7 +174,34 @@ func (r *Runner[T]) Execute(ctx context.Context, opts RunOptions) error {
 		return nil
 	}
 
-	return r.drain(ctx, opts)
+	if err := r.drain(ctx, opts); err != nil {
+		return err
+	}
+
+	if err := r.captureSummary(ctx); err != nil {
+		return err
+	}
+
+	return r.archiveIfDrained(ctx, opts)
+}
+
+// captureSummary reads the final tasks-table counts and stashes them on
+// the runner so callers can read them even after archive-on-success has
+// closed the DB handle.
+func (r *Runner[T]) captureSummary(ctx context.Context) error {
+	var s Summary
+	err := r.db.QueryRowContext(ctx,
+		`SELECT
+		   COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN status='running' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN status='done'    THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END), 0)
+		 FROM tasks`).Scan(&s.Pending, &s.Running, &s.Done, &s.Failed)
+	if err != nil {
+		return fmt.Errorf("taskrunner: capture summary: %w", err)
+	}
+	r.summary = s
+	return nil
 }
 
 func (o RunOptions) withDefaults() RunOptions {
