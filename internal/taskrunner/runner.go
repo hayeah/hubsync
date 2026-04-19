@@ -11,20 +11,24 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "modernc.org/sqlite"
 )
 
 // Config wires up a domain type T to the runner. Plan is called exactly
 // when items is empty (first invocation or after a manual wipe); Decode
 // is called on every row the claim loop picks up.
 type Config[T Task] struct {
-	// DBPath is the DuckDB file. Empty uses ":memory:".
+	// DBPath is the SQLite file path. Empty uses an in-memory database.
+	// The file is opened in WAL journal mode so external readers (e.g.
+	// `sqlite3 file.db "select … from tasks"`) can observe task state
+	// while a writer is running.
 	DBPath string
 
-	// Plan emits one T per unit of work. The runner serializes each to
-	// JSON, writes a JSONL temp file, and materializes the items table
-	// via DuckDB's read_json_auto. Every emitted row must carry a
-	// stable, unique "id" field.
+	// Plan emits one T per unit of work. The runner reflects on T's
+	// struct tags to build a typed items table (with columns derived
+	// from `json:"…"` tags) and streams each emitted row through a
+	// prepared INSERT. Every emitted row must carry a non-empty `id`
+	// field (the `id` JSON tag); id becomes items' PRIMARY KEY.
 	Plan func(ctx context.Context, emit func(T)) error
 
 	// Decode turns one items row into a runnable T. The row map contains
@@ -51,18 +55,18 @@ type Runner[T Task] struct {
 	cfg Config[T]
 	db  *sql.DB
 
-	// writeMu serializes every writing statement against the single DuckDB
-	// connection. DuckDB is process-single-writer and the go driver
-	// happily hands out parallel conns from the pool; we avoid the
-	// "database is locked" path by funneling writes ourselves.
+	// writeMu serializes writing statements within this process. SQLite in
+	// WAL mode allows concurrent readers with a single writer; busy_timeout
+	// absorbs cross-process contention, and writeMu spares us from that
+	// retry loop for intra-process writes (claim / heartbeat / terminal).
 	writeMu sync.Mutex
 
 	// planErr captures the first error seen during the emit callback.
 	planErr error
 }
 
-// New opens the DB and ensures the tasks/runs tables exist. The items
-// table is created later, on first plan.
+// New opens the SQLite database in WAL mode and ensures the tasks/runs
+// tables exist. The items table is created lazily on first plan.
 func New[T Task](cfg Config[T]) (*Runner[T], error) {
 	if cfg.Plan == nil {
 		return nil, errors.New("taskrunner: Config.Plan is required")
@@ -70,22 +74,29 @@ func New[T Task](cfg Config[T]) (*Runner[T], error) {
 	if cfg.Decode == nil {
 		return nil, errors.New("taskrunner: Config.Decode is required")
 	}
-	dsn := cfg.DBPath
-	if dsn == "" {
-		dsn = ""
-	}
-	db, err := sql.Open("duckdb", dsn)
+	dsn := sqliteDSN(cfg.DBPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("taskrunner: open %s: %w", cfg.DBPath, err)
 	}
-	// DuckDB cannot serve concurrent writers on a single handle; restrict
-	// the pool to one connection and let the writeMu serialize callers.
-	db.SetMaxOpenConns(1)
 	if err := ensureTasksTable(db); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Runner[T]{cfg: cfg, db: db}, nil
+}
+
+// sqliteDSN builds a modernc.org/sqlite DSN that enables WAL, a 5s
+// busy_timeout (so concurrent writers backoff instead of erroring), and
+// foreign_keys (harmless here, sane default). An empty path maps to an
+// in-memory DB that is also shared-cache so multiple *sql.DB handles
+// from the same process can see the same data during tests.
+func sqliteDSN(path string) string {
+	const pragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
+	if path == "" {
+		return "file::memory:?cache=shared&" + pragmas
+	}
+	return "file:" + path + "?" + pragmas
 }
 
 // Close releases the DB handle.
@@ -290,7 +301,7 @@ func (r *Runner[T]) workQueueWhere(opts RunOptions) string {
 	builtin := fmt.Sprintf(
 		`(status='pending'
 		   OR (status='failed'  AND attempts<%d)
-		   OR (status='running' AND (heartbeat_at IS NULL OR heartbeat_at < now() - INTERVAL %d SECOND)))`,
+		   OR (status='running' AND (heartbeat_at IS NULL OR heartbeat_at < datetime('now', '-%d seconds'))))`,
 		opts.MaxAttempts,
 		int(opts.Stale.Seconds()),
 	)
@@ -352,14 +363,14 @@ func (r *Runner[T]) claim(ctx context.Context, id string, opts RunOptions) (bool
 		`UPDATE tasks
 		    SET status       = 'running',
 		        attempts     = attempts + 1,
-		        started_at   = now(),
-		        heartbeat_at = now(),
+		        started_at   = CURRENT_TIMESTAMP,
+		        heartbeat_at = CURRENT_TIMESTAMP,
 		        error        = NULL
 		  WHERE id = ?
 		    AND (status = 'pending'
 		      OR (status = 'failed'  AND attempts < %d)
 		      OR (status = 'running' AND (heartbeat_at IS NULL
-		          OR heartbeat_at < now() - INTERVAL %d SECOND)))`,
+		          OR heartbeat_at < datetime('now', '-%d seconds'))))`,
 		opts.MaxAttempts,
 		int(opts.Stale.Seconds()),
 	)
@@ -408,7 +419,7 @@ func (r *Runner[T]) beat(ctx context.Context, id string, status any) {
 
 	if status == nil {
 		_, _ = r.db.ExecContext(ctx,
-			`UPDATE tasks SET heartbeat_at = now() WHERE id = ?`, id)
+			`UPDATE tasks SET heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 		return
 	}
 	buf, err := json.Marshal(status)
@@ -417,8 +428,8 @@ func (r *Runner[T]) beat(ctx context.Context, id string, status any) {
 	}
 	_, _ = r.db.ExecContext(ctx,
 		`UPDATE tasks
-		    SET heartbeat_at = now(),
-		        meta = json_merge_patch(meta, json_object('status', ?::JSON))
+		    SET heartbeat_at = CURRENT_TIMESTAMP,
+		        meta = json_patch(meta, json_object('status', json(?)))
 		  WHERE id = ?`,
 		string(buf), id)
 }
@@ -445,11 +456,11 @@ func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr
 			_, err := r.db.ExecContext(ctx,
 				`UPDATE tasks
 				    SET status       = 'done',
-				        ended_at     = now(),
-				        heartbeat_at = now(),
+				        ended_at     = CURRENT_TIMESTAMP,
+				        heartbeat_at = CURRENT_TIMESTAMP,
 				        error        = NULL,
-				        meta = CASE WHEN ?::VARCHAR IS NULL THEN meta
-				                    ELSE json_merge_patch(meta, json_object('result', ?::JSON))
+				        meta = CASE WHEN ? IS NULL THEN meta
+				                    ELSE json_patch(meta, json_object('result', json(?)))
 				               END
 				  WHERE id = ?`,
 				nullIfEmpty(resultJSON), nullIfEmpty(resultJSON), id)
@@ -468,8 +479,8 @@ func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE tasks
 		    SET status       = 'failed',
-		        ended_at     = now(),
-		        heartbeat_at = now(),
+		        ended_at     = CURRENT_TIMESTAMP,
+		        heartbeat_at = CURRENT_TIMESTAMP,
 		        error        = ?
 		  WHERE id = ?`,
 		msg, id)

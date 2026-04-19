@@ -41,8 +41,8 @@ func ensureTasksTable(db *sql.DB) error {
 func itemsEmpty(db *sql.DB) (bool, error) {
 	var exists int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM information_schema.tables
-		  WHERE table_name = 'items' AND table_schema = 'main'`,
+		`SELECT COUNT(*) FROM sqlite_master
+		  WHERE type='table' AND name='items'`,
 	).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("taskrunner: probe items table: %w", err)

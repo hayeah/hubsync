@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/hayeah/hubsync"
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "modernc.org/sqlite"
 )
 
 // binPath is set by TestMain — one `go build` per test run.
@@ -158,7 +158,7 @@ type archiveItem struct {
 // queryArchiveItems reads the items table from the task-runner DuckDB file.
 func queryArchiveItems(t *testing.T, dbPath string) []archiveItem {
 	t.Helper()
-	db, err := sql.Open("duckdb", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open %s: %v", dbPath, err)
 	}
@@ -182,7 +182,7 @@ func queryArchiveItems(t *testing.T, dbPath string) []archiveItem {
 // queryTaskCount returns the number of tasks rows in the given status.
 func queryTaskCount(t *testing.T, dbPath, status string) int {
 	t.Helper()
-	db, err := sql.Open("duckdb", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open %s: %v", dbPath, err)
 	}

@@ -2,6 +2,7 @@ package taskrunner
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -298,8 +299,10 @@ func TestExecute_StaleRunningReclaim(t *testing.T) {
 	}
 	if _, err := r.DB().Exec(
 		`UPDATE tasks
-		    SET status='running', started_at=now() - INTERVAL 1 HOUR,
-		        heartbeat_at=now() - INTERVAL 1 HOUR, attempts=1
+		    SET status='running',
+		        started_at   = datetime('now', '-1 hour'),
+		        heartbeat_at = datetime('now', '-1 hour'),
+		        attempts     = 1
 		  WHERE id='z'`); err != nil {
 		t.Fatal(err)
 	}
@@ -417,6 +420,85 @@ func TestExecute_FeedBackpressureDoesNotDeadlock(t *testing.T) {
 
 	ranMu.Lock()
 	defer ranMu.Unlock()
+	if len(ran) != N {
+		t.Fatalf("expected %d runs, got %d", N, len(ran))
+	}
+}
+
+// TestExecute_ConcurrentReaderSeesProgress opens a second *sql.DB
+// handle against the same file and confirms that task state is visible
+// while Execute is still running. This is the whole point of the
+// SQLite WAL swap: ops can `sqlite3 file.db 'select … from tasks'`
+// mid-run to see progress.
+func TestExecute_ConcurrentReaderSeesProgress(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concread.duckdb")
+
+	const N = 12
+	var ran []string
+	var ranMu sync.Mutex
+
+	cfg := Config[*echoTask]{
+		DBPath: dbPath,
+		Plan: func(ctx context.Context, emit func(*echoTask)) error {
+			for i := 0; i < N; i++ {
+				emit(&echoTask{ID: fmt.Sprintf("t%02d", i)})
+			}
+			return nil
+		},
+		Decode: func(row map[string]any) (*echoTask, error) {
+			id, _ := row["id"].(string)
+			return &echoTask{
+				ID:    id,
+				ran:   &ran,
+				ranMu: &ranMu,
+				sleep: 50 * time.Millisecond,
+			}, nil
+		},
+	}
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- r.Execute(context.Background(), RunOptions{Workers: 2})
+	}()
+
+	// A second handle — i.e. what `sqlite3` or another process would
+	// see. Poll until at least one row has flipped to done, with a
+	// deadline short enough to fail fast if WAL isn't actually serving
+	// concurrent reads.
+	readerDB, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readerDB.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var sawDone bool
+	for time.Now().Before(deadline) {
+		var done int
+		err := readerDB.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status='done'`).Scan(&done)
+		if err != nil {
+			t.Fatalf("reader query: %v", err)
+		}
+		if done > 0 {
+			sawDone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !sawDone {
+		t.Fatal("second handle never saw a 'done' task while writer was running (WAL concurrency broken?)")
+	}
+
+	// Let the run finish.
+	if err := <-execDone; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
 	if len(ran) != N {
 		t.Fatalf("expected %d runs, got %d", N, len(ran))
 	}
