@@ -162,6 +162,56 @@ func TestArchiveWorkerSkipsAlreadyArchived(t *testing.T) {
 	}
 }
 
+// TestArchiveWorkerHeadMatchSkipsRetryUpload covers the serve-mode
+// idempotency gap that the shared archiveOne helper exists to close.
+// Scenario: a previous upload succeeded but crashed before MarkArchived,
+// leaving the row in 'dirty' with the bytes already at the remote
+// head. The retry — driven through the watch path — must short-circuit
+// on the head-match check rather than uploading a second B2 version.
+func TestArchiveWorkerHeadMatchSkipsRetryUpload(t *testing.T) {
+	env := newWorkerEnv(t)
+	bc := NewBroadcaster()
+	env.worker.Broadcaster = bc
+
+	env.stampLocalAndEntry(t, "retry.txt", "payload")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- env.worker.Run(ctx) }()
+
+	// First pass: baseline picks the row up and uploads.
+	waitForCondition(t, func() bool {
+		e, _, _ := env.store.EntryLookup("retry.txt")
+		return e.ArchiveState == ArchiveStateArchived
+	}, 2*time.Second)
+	if got := env.storage.VersionCount("backups/test/retry.txt"); got != 1 {
+		t.Fatalf("after first upload VersionCount = %d want 1", got)
+	}
+
+	// Simulate a crash that landed the bytes remote but never stamped
+	// MarkArchived: flip the state back to dirty. The remote head is
+	// still the version we uploaded above, so the retry should
+	// head-match and re-stamp without a second Upload call.
+	if err := env.store.MarkArchiveDirty("retry.txt"); err != nil {
+		t.Fatal(err)
+	}
+	bc.Broadcast(ChangeEntry{Path: "retry.txt", Op: OpUpdate, Kind: FileKindFile})
+
+	waitForCondition(t, func() bool {
+		e, _, _ := env.store.EntryLookup("retry.txt")
+		return e.ArchiveState == ArchiveStateArchived
+	}, 2*time.Second)
+
+	if got := env.storage.VersionCount("backups/test/retry.txt"); got != 1 {
+		t.Errorf("retry stacked a B2 version: VersionCount = %d want 1", got)
+	}
+
+	cancel()
+	<-errCh
+}
+
 // waitFor polls the condition up to d; fails the test if it doesn't become
 // true in time.
 func waitForCondition(t *testing.T, cond func() bool, d time.Duration) {

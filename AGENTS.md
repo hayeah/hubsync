@@ -21,7 +21,7 @@ What runs:
 - `scanner_test.go` — digest cache, diff (create/update/delete ordering).
 - `client_store_test.go` — client hub_tree upserts + ApplyChange.
 - `reconciler_test.go` — pin/unpin planner over all 5 starting states + full pin→unpin→re-pin cycle against `archive.FakeStorage`.
-- `archive_worker_test.go` — baseline drain + broadcaster pickup + already-archived idempotency.
+- `archive_worker_test.go` — baseline drain + broadcaster pickup + already-archived idempotency + head-match short-circuit on retry (the shared `archiveOne` helper in `archive_one.go` is what wires the same idempotency contract into both the watch and one-shot paths).
 - `rpc_test.go` — pin / unpin / ls / status over unix socket (JSON). Uses `/tmp` sockets because macOS sun_path is 104 bytes.
 - `e2e_test.go` — hub↔Go-client: subscribe stream, snapshot bootstrap, catchup, push conflicts, delta.
 - `archive/fake_test.go` — FakeStorage upload/head/download/presign round-trip.
