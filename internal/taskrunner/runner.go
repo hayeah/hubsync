@@ -109,6 +109,12 @@ var (
 	ErrFailedRemain = errors.New("taskrunner: failed row(s) remain")
 )
 
+// attemptsColumn is the alias the feed-query uses for tasks.attempts so
+// it never collides with a user-side items column named `attempts`.
+// The double-underscore prefix is a sentinel — user Task types must not
+// emit a JSON tag starting with `__tr_`.
+const attemptsColumn = "__tr_attempts"
+
 // New opens the SQLite DB, probes the factory to infer the items
 // schema, and returns a Runner ready for Execute. Callers that only
 // want the packaged run-loop should prefer Run.
@@ -339,11 +345,20 @@ func (r *Runner) drain(ctx context.Context, opts RunOptions) error {
 // eligible. Dedup is by (id, attempts): we only emit a row again once
 // its attempts counter has bumped (i.e. a previous attempt completed
 // and terminal-wrote 'failed').
+//
+// The SELECT is explicit (items.* plus the single tasks column we
+// actually read) to avoid a column-name collision when the user's Task
+// struct shadows a tasks-table name like `meta`, `status`, `attempts`.
+// Under `SELECT *` on a JOIN-USING, SQLite surfaces both sides and the
+// row-map assignment silently overwrote items columns with tasks values.
 func (r *Runner) feedQueue(ctx context.Context, opts RunOptions, queue chan<- map[string]any) error {
 	where := r.workQueueWhere(opts)
 	query := fmt.Sprintf(
-		`SELECT * FROM items JOIN tasks USING (id) WHERE %s ORDER BY id`,
-		where,
+		`SELECT items.*, tasks.attempts AS %s
+		   FROM items JOIN tasks USING (id)
+		  WHERE %s
+		  ORDER BY items.id`,
+		attemptsColumn, where,
 	)
 	seen := map[string]int64{}
 
@@ -407,11 +422,16 @@ func (r *Runner) fetchBatch(ctx context.Context, query string, seen map[string]i
 			row[name] = raw[i]
 		}
 		id, _ := row["id"].(string)
-		attempts := asInt64FromAny(row["attempts"])
+		attempts := asInt64FromAny(row[attemptsColumn])
 		if prev, ok := seen[id]; ok && attempts <= prev {
 			continue
 		}
 		seen[id] = attempts
+		// Strip the sentinel so downstream (hydrate's row-to-JSON build)
+		// doesn't see it. schema.columns already filters hydrate's
+		// iteration, but dropping it keeps the row map tidy for any
+		// future consumer.
+		delete(row, attemptsColumn)
 		batch = append(batch, row)
 	}
 	if err := rows.Err(); err != nil {
