@@ -379,7 +379,7 @@ func cmdLs(args []string) {
 	if err != nil {
 		log.Fatalf("ls: %v", err)
 	}
-	renderLs(os.Stdout, resp.Entries)
+	renderLs(os.Stdout, hc.root, resp.Entries)
 }
 
 // --- status --------------------------------------------------------------
