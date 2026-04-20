@@ -258,7 +258,7 @@ hubsync ls [path] [--all]
 | positional `path` | `.` | Cwd-relative hub path. `.` (or omitted) = cwd's level. Escaping the hub errors. |
 | `--all` | `false` | Emit every `hub_entry` row regardless of path (pre-prefix behavior). |
 
-Output is **always JSONL**, one row per entry. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
+Output is **always JSONL**, one row per entry, with a `//`-comment **docstring** preamble describing the columns, example record, and the underlying SQLite DB path. Follows the [JSONL docstring convention](https://github.com/hayeah/dotfiles) — `duckql` strips the `//` lines transparently; for `jq`, prefilter with `grep -v '^//'`. For a human table on the terminal, pipe to `duckql` (which handles TTY formatting).
 
 `ls` is read-only and never RPCs — it opens `hub.db` directly under SQLite WAL, so it works whether or not `hubsync serve` is running.
 

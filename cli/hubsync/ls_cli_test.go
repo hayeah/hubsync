@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,6 +50,10 @@ func parseLsLines(t *testing.T, out string) map[string]struct {
 	}{}
 	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 		if line == "" {
+			continue
+		}
+		// Skip the ls-pattern `//` docstring prelude — data lines follow.
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "//") {
 			continue
 		}
 		var r struct {
@@ -182,5 +188,112 @@ func TestCmdLs_NoHubsync_Errors(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "no .hubsync/") {
 		t.Errorf("stderr should say no .hubsync/: %s", stderr)
+	}
+}
+
+// TestCmdLs_Docstring_PresentAndPointsAtDB verifies the `//`-comment
+// prelude emitted above the JSONL body: it must include the underlying
+// SQLite DB path and at least one `duckql` sample query, as called for
+// by the ls-pattern docstring convention.
+func TestCmdLs_Docstring_PresentAndPointsAtDB(t *testing.T) {
+	dir := seededLsHub(t)
+	stdout, stderr, code := runCLI(t, dir, nil, "ls", "--all")
+	if code != 0 {
+		t.Fatalf("ls --all: code=%d stderr=%s", code, stderr)
+	}
+	// Split comment-lines from data-lines.
+	var comments, data []string
+	for _, line := range strings.Split(strings.TrimRight(stdout, "\n"), "\n") {
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "//") {
+			comments = append(comments, line)
+		} else if line != "" {
+			data = append(data, line)
+		}
+	}
+	if len(comments) == 0 {
+		t.Fatalf("expected a `//` docstring prelude; got output:\n%s", stdout)
+	}
+	if len(data) == 0 {
+		t.Fatalf("expected data rows after the prelude; got output:\n%s", stdout)
+	}
+	// Docstring must name the underlying DB path.
+	dbPath := filepath.Join(dir, ".hubsync", "hub.db")
+	joined := strings.Join(comments, "\n")
+	if !strings.Contains(joined, dbPath) {
+		t.Errorf("docstring should name the DB path %q\n%s", dbPath, joined)
+	}
+	if !strings.Contains(joined, "duckql") {
+		t.Errorf("docstring should include at least one duckql sample query\n%s", joined)
+	}
+	// Data rows must parse as strict JSON (no stray `//` mixed in).
+	for _, line := range data {
+		var v map[string]any
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			t.Errorf("data row is not strict JSON: %q: %v", line, err)
+		}
+	}
+}
+
+// TestCmdLs_Docstring_DuckqlRoundTrip proves the full pipeline:
+// `hubsync ls` → `duckql "WHERE …"` works end-to-end with the prelude
+// present; duckql strips the `//` lines and the row count is preserved.
+// Respects $DUCKQL_BIN for cross-worktree testing; falls back to PATH.
+// Skipped gracefully if `duckql` isn't available.
+func TestCmdLs_Docstring_DuckqlRoundTrip(t *testing.T) {
+	var (
+		duckqlBin string
+		duckqlArgs []string
+	)
+	if override := os.Getenv("DUCKQL_BIN"); override != "" {
+		parts := strings.Fields(override)
+		duckqlBin, duckqlArgs = parts[0], parts[1:]
+	} else {
+		found, err := exec.LookPath("duckql")
+		if err != nil {
+			t.Skip("duckql not on PATH (set $DUCKQL_BIN to override); skipping round-trip test")
+		}
+		duckqlBin = found
+	}
+	// Probe: skip if the duckql we're about to run doesn't know
+	// --no-strip-comments (i.e. it predates the comment-stripping
+	// feature). Running an old duckql would fail deterministically on
+	// the `//` prelude and produce a misleading test failure.
+	probeArgs := append([]string{}, duckqlArgs...)
+	probeArgs = append(probeArgs, "--help")
+	probe, probeErr := exec.Command(duckqlBin, probeArgs...).CombinedOutput()
+	if probeErr != nil {
+		t.Skipf("duckql --help failed, skipping: %v\n%s", probeErr, probe)
+	}
+	if !strings.Contains(string(probe), "--no-strip-comments") {
+		t.Skip("installed duckql predates --no-strip-comments; set DUCKQL_BIN to a newer build")
+	}
+	dir := seededLsHub(t)
+	stdout, stderr, code := runCLI(t, dir, nil, "ls", "--all")
+	if code != 0 {
+		t.Fatalf("ls --all: code=%d stderr=%s", code, stderr)
+	}
+	// Pipe the raw ls output (docstring + body) through duckql; the
+	// downstream tool must see the 5 data rows despite the `//` prelude.
+	args := append([]string{}, duckqlArgs...)
+	args = append(args, "-o", "jsonl:-", "SELECT count(*) AS n")
+	cmd := exec.Command(duckqlBin, args...)
+	cmd.Stdin = bytes.NewReader([]byte(stdout))
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("duckql: %v\nstderr:\n%s", err, string(ee.Stderr))
+		}
+		t.Fatal(err)
+	}
+	var r struct {
+		N int `json:"n"`
+	}
+	line := strings.TrimRight(string(out), "\n")
+	if err := json.Unmarshal([]byte(line), &r); err != nil {
+		t.Fatalf("parse duckql output %q: %v", line, err)
+	}
+	// 5 files from seededLsHub.
+	if r.N != 5 {
+		t.Errorf("duckql count = %d, want 5 (docstring-strip broken?)", r.N)
 	}
 }
