@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/hayeah/hubsync/archive"
 )
 
 // Fixed filenames under .hubsync/.
@@ -163,6 +165,11 @@ var ErrNoMatches = errors.New("no matches")
 // RunReconcile is the in-process pin/unpin driver, shared by the RPC handler
 // and the one-shot CLI path. Expands globs, plans + (unless dry) applies each
 // path's plan, and returns a PinResponse with per-path results.
+//
+// For unpin runs with an archive storage configured, RunReconcile issues a
+// single ListKeys per glob (using the glob's literal prefix) and passes the
+// resulting map to Apply. This replaces N sequential HEAD calls in Evict with
+// one paginated list, which is dramatically faster on large prefixes.
 func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req PinRequest, target TargetState) (PinResponse, error) {
 	matches, err := store.MatchGlobs(req.Globs)
 	if err != nil {
@@ -171,6 +178,16 @@ func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req Pin
 	if len(matches) == 0 {
 		return PinResponse{}, ErrNoMatches
 	}
+
+	var applyOpts []ApplyOption
+	if target == TargetUnpinned && !req.Dry && rec != nil && rec.Storage != nil {
+		remote, err := remoteLookupForGlobs(ctx, rec, req.Globs)
+		if err != nil {
+			return PinResponse{}, err
+		}
+		applyOpts = append(applyOpts, WithRemoteLookup(remote))
+	}
+
 	resp := PinResponse{}
 	for _, path := range matches {
 		var plan Plan
@@ -188,13 +205,52 @@ func RunReconcile(ctx context.Context, rec *Reconciler, store *HubStore, req Pin
 		if planErr != nil {
 			res.Error = planErr.Error()
 		} else if !req.Dry {
-			if err := rec.Apply(ctx, plan); err != nil {
+			if err := rec.Apply(ctx, plan, applyOpts...); err != nil {
 				res.Error = err.Error()
 			}
 		}
 		resp.Results = append(resp.Results, res)
 	}
 	return resp, nil
+}
+
+// remoteLookupForGlobs drains ListKeys for each glob's literal prefix and
+// merges the results into one map keyed by full bucket key. Common-prefix
+// markers (FileID=="") are dropped; only real objects populate the map.
+func remoteLookupForGlobs(ctx context.Context, rec *Reconciler, globs []string) (map[string]archive.RemoteInfo, error) {
+	m := make(map[string]archive.RemoteInfo)
+	seen := make(map[string]struct{}, len(globs))
+	for _, g := range globs {
+		prefix := archive.JoinKey(rec.Prefix, literalPrefix(g))
+		if _, dup := seen[prefix]; dup {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		it := rec.Storage.ListKeys(ctx, prefix, "")
+		for it.Next() {
+			e := it.Entry()
+			if e.FileID == "" {
+				continue
+			}
+			m[e.Key] = e
+		}
+		if err := it.Err(); err != nil {
+			return nil, fmt.Errorf("list %q: %w", prefix, err)
+		}
+	}
+	return m, nil
+}
+
+// literalPrefix returns the leading slice of g before any glob metacharacter.
+// Mirrors doublestar's metacharacter set: * ? [ { \.
+func literalPrefix(g string) string {
+	for i := 0; i < len(g); i++ {
+		switch g[i] {
+		case '*', '?', '[', '{', '\\':
+			return g[:i]
+		}
+	}
+	return g
 }
 
 // ---- ls ---------------------------------------------------------------

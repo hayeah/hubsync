@@ -102,9 +102,31 @@ func (r *Reconciler) PlanUnpin(path string) (Plan, error) {
 	return p, nil
 }
 
+// ApplyOption tweaks how Apply performs a step. See WithRemoteLookup.
+type ApplyOption func(*applyOpts)
+
+type applyOpts struct {
+	// remoteByKey, when non-nil, replaces StepEvict's per-path HeadByKey with
+	// a map lookup (key = JoinKey(Prefix, path)). Paths missing from the map
+	// are reported as "archived per DB but not found remotely" instead of
+	// silently falling through to HEAD. Empty non-nil map => every path errors.
+	remoteByKey map[string]archive.RemoteInfo
+}
+
+// WithRemoteLookup switches Evict from per-path HeadByKey to a single
+// map lookup against a pre-fetched listing. Intended for batch unpin across
+// many files under one prefix: one ListKeys call replaces N HEADs.
+func WithRemoteLookup(m map[string]archive.RemoteInfo) ApplyOption {
+	return func(o *applyOpts) { o.remoteByKey = m }
+}
+
 // Apply runs the plan to completion, committing each step before moving on.
 // It is safe to call inside the archive worker's goroutine (single writer).
-func (r *Reconciler) Apply(ctx context.Context, plan Plan) error {
+func (r *Reconciler) Apply(ctx context.Context, plan Plan, opts ...ApplyOption) error {
+	var o applyOpts
+	for _, f := range opts {
+		f(&o)
+	}
 	for _, step := range plan.Steps {
 		switch step {
 		case StepNoOp:
@@ -118,7 +140,7 @@ func (r *Reconciler) Apply(ctx context.Context, plan Plan) error {
 				return fmt.Errorf("archive %s: %w", plan.Path, err)
 			}
 		case StepEvict:
-			if err := r.Evict(ctx, plan.Path); err != nil {
+			if err := r.evictWith(ctx, plan.Path, &o); err != nil {
 				return fmt.Errorf("evict %s: %w", plan.Path, err)
 			}
 		case StepRestore:
@@ -172,6 +194,10 @@ func (r *Reconciler) Archive(ctx context.Context, path string) error {
 // unlinking so the watcher callback reads the post-change row and swallows
 // the fsnotify delete.
 func (r *Reconciler) Evict(ctx context.Context, path string) error {
+	return r.evictWith(ctx, path, &applyOpts{})
+}
+
+func (r *Reconciler) evictWith(ctx context.Context, path string, o *applyOpts) error {
 	entry, ok, err := r.Store.EntryLookup(path)
 	if err != nil {
 		return err
@@ -184,9 +210,19 @@ func (r *Reconciler) Evict(ctx context.Context, path string) error {
 	}
 
 	key := archive.JoinKey(r.Prefix, path)
-	head, err := r.Storage.HeadByKey(ctx, key)
-	if err != nil {
-		return fmt.Errorf("evict head-check %s: %w", key, err)
+	var head archive.RemoteInfo
+	if o.remoteByKey != nil {
+		hit, found := o.remoteByKey[key]
+		if !found {
+			return fmt.Errorf("evict: archived per DB but not found in remote listing at %q", key)
+		}
+		head = hit
+	} else {
+		hd, err := r.Storage.HeadByKey(ctx, key)
+		if err != nil {
+			return fmt.Errorf("evict head-check %s: %w", key, err)
+		}
+		head = hd
 	}
 	if head.FileID != entry.ArchiveFileID {
 		return fmt.Errorf("evict: remote head fileId=%q differs from recorded %q", head.FileID, entry.ArchiveFileID)

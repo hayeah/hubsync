@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hayeah/hubsync/archive"
@@ -231,6 +232,74 @@ func TestReconcilerEvictAbortsOnRemoteMismatch(t *testing.T) {
 	// Local file should still exist (we aborted before unlink).
 	if _, err := os.Stat(filepath.Join(env.hubDir, "a.txt")); err != nil {
 		t.Errorf("local file should survive aborted evict, stat err=%v", err)
+	}
+}
+
+func TestReconcilerEvictWithRemoteLookup(t *testing.T) {
+	env := newReconcilerEnv(t)
+	env.writeLocal(t, "a.txt", "a")
+	env.appendEntry(t, "a.txt", "a")
+	ctx := context.Background()
+
+	// Pin so there's a real remote version (FakeStorage records digest).
+	pin, err := env.recon.PlanPin("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.recon.Apply(ctx, pin); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a remoteByKey map the way RunReconcile would — via ListKeys.
+	it := env.storage.ListKeys(ctx, env.recon.Prefix, "")
+	remote := map[string]archive.RemoteInfo{}
+	for it.Next() {
+		e := it.Entry()
+		if e.FileID == "" {
+			continue
+		}
+		remote[e.Key] = e
+	}
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := env.recon.PlanUnpin("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.recon.Apply(ctx, plan, WithRemoteLookup(remote)); err != nil {
+		t.Fatalf("batch unpin apply: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(env.hubDir, "a.txt")); !os.IsNotExist(err) {
+		t.Errorf("local should be gone after batch unpin, stat err=%v", err)
+	}
+	e, _, _ := env.store.EntryLookup("a.txt")
+	if e.ArchiveState != ArchiveStateUnpinned {
+		t.Errorf("state=%q, want unpinned", e.ArchiveState)
+	}
+}
+
+func TestReconcilerEvictWithRemoteLookupMissing(t *testing.T) {
+	env := newReconcilerEnv(t)
+	env.writeLocal(t, "a.txt", "a")
+	env.appendEntry(t, "a.txt", "a")
+	// DB thinks it's archived, but remote map is empty.
+	if err := env.store.MarkArchived("a.txt", "pretend-id", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := Plan{Path: "a.txt", Steps: []PlanStep{StepEvict}}
+	err := env.recon.Apply(context.Background(), plan, WithRemoteLookup(map[string]archive.RemoteInfo{}))
+	if err == nil {
+		t.Fatal("expected error for archived-per-DB-but-missing-remote")
+	}
+	if !strings.Contains(err.Error(), "not found in remote listing") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	// Local file must still exist — we aborted before unlink.
+	if _, err := os.Stat(filepath.Join(env.hubDir, "a.txt")); err != nil {
+		t.Errorf("local file should survive, stat err=%v", err)
 	}
 }
 
