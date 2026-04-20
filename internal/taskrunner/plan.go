@@ -9,36 +9,37 @@ import (
 	"time"
 )
 
-// itemSchema is the column shape derived from T's struct tags. Columns
-// are ordered by struct field order, which makes CREATE TABLE output
-// deterministic and easy to eyeball.
+// itemSchema is the column shape derived from the factory's sample
+// Task. Columns are ordered by struct field order so CREATE TABLE is
+// deterministic.
 type itemSchema struct {
-	columns []itemColumn
-	idIdx   int // index into columns of the `id` field
+	columns    []itemColumn
+	idIdx      int          // index into columns of the `id` field
+	schemaType reflect.Type // the sample's concrete type (pointer or value); plan-loop validates each emit against this
 }
 
 type itemColumn struct {
 	name    string       // JSON tag name (= SQLite column name)
 	goType  reflect.Type // field type on the struct
-	sqlType string       // SQLite affinity: TEXT / INTEGER / REAL
-	// isJSON marks complex Go types (structs, slices, maps) that we
-	// serialize to JSON and store as TEXT.
-	isJSON bool
+	sqlType string       // SQLite affinity: TEXT / INTEGER / REAL / BLOB
+	isJSON  bool         // true for complex Go types stored as JSON TEXT
 }
 
-// inferItemSchema walks T's exported fields and derives a SQLite
-// column list. Fields with json:"-" are skipped; struct-typed fields
-// are stored as JSON text. One column MUST be tagged `id`; it becomes
-// the PRIMARY KEY.
-func inferItemSchema[T Task]() (itemSchema, error) {
-	// reflect.TypeFor[T]() works for both value and pointer T. Callers
-	// always pass a pointer type in practice, so we unwrap one level.
-	t := reflect.TypeFor[T]()
+// inferItemSchema walks the sample Task's exported fields and derives a
+// SQLite column list. Fields tagged `json:"-"` are skipped; struct /
+// slice / map / array / interface fields become JSON TEXT. One column
+// MUST be tagged `id`; it becomes items' PRIMARY KEY.
+func inferItemSchema(sample any) (itemSchema, error) {
+	if sample == nil {
+		return itemSchema{}, fmt.Errorf("taskrunner: factory.Hydrate returned nil")
+	}
+	declaredType := reflect.TypeOf(sample)
+	t := declaredType
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
-		return itemSchema{}, fmt.Errorf("taskrunner: T must be a struct (or pointer to struct), got %s", t.Kind())
+		return itemSchema{}, fmt.Errorf("taskrunner: Task must be a struct (or pointer to struct), got %s", t.Kind())
 	}
 
 	var cols []itemColumn
@@ -67,15 +68,13 @@ func inferItemSchema[T Task]() (itemSchema, error) {
 		})
 	}
 	if idIdx < 0 {
-		return itemSchema{}, fmt.Errorf("taskrunner: T %s has no `json:\"id\"` field", t.Name())
+		return itemSchema{}, fmt.Errorf("taskrunner: Task type %s has no `json:\"id\"` field", t.Name())
 	}
-	return itemSchema{columns: cols, idIdx: idIdx}, nil
+	return itemSchema{columns: cols, idIdx: idIdx, schemaType: declaredType}, nil
 }
 
 // jsonFieldName extracts the JSON column name from a struct field's
-// `json` tag. Returns (name, keep). keep=false for fields tagged "-" or
-// otherwise excluded (e.g. transient unexported). Fields without a
-// `json` tag are included under their Go field name.
+// `json` tag.
 func jsonFieldName(f reflect.StructField) (string, bool) {
 	tag := f.Tag.Get("json")
 	if tag == "-" {
@@ -91,14 +90,11 @@ func jsonFieldName(f reflect.StructField) (string, bool) {
 	return name, true
 }
 
-// sqliteTypeFor maps a Go type to a SQLite column affinity. Returns
-// (sqlType, isJSON). isJSON signals that values should be
-// json.Marshal'd into a string before binding.
+// sqliteTypeFor maps a Go type to a SQLite column affinity.
 func sqliteTypeFor(t reflect.Type) (string, bool, error) {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	// Special case time.Time → TEXT in ISO-8601.
 	if t == reflect.TypeOf(time.Time{}) {
 		return "TEXT", false, nil
 	}
@@ -112,7 +108,6 @@ func sqliteTypeFor(t reflect.Type) (string, bool, error) {
 	case reflect.Float32, reflect.Float64:
 		return "REAL", false, nil
 	case reflect.Slice:
-		// []byte → BLOB; other slices → JSON TEXT.
 		if t.Elem().Kind() == reflect.Uint8 {
 			return "BLOB", false, nil
 		}
@@ -120,25 +115,19 @@ func sqliteTypeFor(t reflect.Type) (string, bool, error) {
 	case reflect.Map, reflect.Struct, reflect.Array:
 		return "TEXT", true, nil
 	case reflect.Interface:
-		// Values land in the DB as whatever concrete type the emitter
-		// hands us; binding as JSON is the safe catch-all.
 		return "TEXT", true, nil
 	}
 	return "", false, fmt.Errorf("unsupported field kind %s", t.Kind())
 }
 
-// runPlan builds the items table (if it doesn't yet exist) and streams
-// emitted rows through a prepared INSERT. Each emitted row is reflected
-// against the inferred schema; complex fields are JSON-marshaled before
-// binding.
+// runPlan builds items (if absent) and streams emitted rows through a
+// prepared INSERT. Consumes the factory's List iterator; each yielded
+// (task, nil) is type-checked against the cached schema, bound, and
+// INSERTed. A yielded error aborts planning; a bind or INSERT failure
+// stops the iterator via yield-returning-false.
 //
 // Called only when itemsEmpty returned true.
-func (r *Runner[T]) runPlan(ctx context.Context) error {
-	schema, err := inferItemSchema[T]()
-	if err != nil {
-		return err
-	}
-
+func (r *Runner) runPlan(ctx context.Context) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
@@ -148,69 +137,69 @@ func (r *Runner[T]) runPlan(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// CREATE TABLE items (...) — but only if absent. If a previous
+	// CREATE TABLE items — but only if absent. If a previous
 	// plan-with-zero-emits left behind a (id TEXT PRIMARY KEY) stub,
-	// drop it first so the next plan gets the full schema.
+	// drop it first.
 	var existingCols int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM pragma_table_info('items')`).Scan(&existingCols); err != nil {
 		return fmt.Errorf("taskrunner: probe items cols: %w", err)
 	}
-	if existingCols > 0 && existingCols < len(schema.columns) {
+	if existingCols > 0 && existingCols < len(r.schema.columns) {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE items`); err != nil {
 			return fmt.Errorf("taskrunner: drop stub items: %w", err)
 		}
 		existingCols = 0
 	}
 	if existingCols == 0 {
-		if _, err := tx.ExecContext(ctx, schema.createTableSQL()); err != nil {
+		if _, err := tx.ExecContext(ctx, r.schema.createTableSQL()); err != nil {
 			return fmt.Errorf("taskrunner: create items: %w", err)
 		}
 	}
 
-	insertSQL := schema.insertSQL()
-	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	stmt, err := tx.PrepareContext(ctx, r.schema.insertSQL())
 	if err != nil {
 		return fmt.Errorf("taskrunner: prepare insert items: %w", err)
 	}
 	defer stmt.Close()
 
-	var count int
 	ids := make(map[string]struct{})
-	emit := func(t T) {
-		if r.planErr != nil {
-			return
+	r.planErr = nil
+
+	seq := r.cfg.Factory.List(ctx)
+	for task, yieldErr := range seq {
+		if yieldErr != nil {
+			r.planErr = fmt.Errorf("taskrunner: plan: %w", yieldErr)
+			break
 		}
-		row, idVal, encErr := schema.bind(t)
+		if reflect.TypeOf(task) != r.schema.schemaType {
+			r.planErr = fmt.Errorf("taskrunner: plan yielded wrong type: got %T, want %s", task, r.schema.schemaType)
+			break
+		}
+		row, idVal, encErr := r.schema.bind(task)
 		if encErr != nil {
 			r.planErr = fmt.Errorf("taskrunner: bind plan row: %w", encErr)
-			return
+			break
 		}
 		if idVal == "" {
 			r.planErr = fmt.Errorf("taskrunner: emitted row has empty id")
-			return
+			break
 		}
 		if _, dup := ids[idVal]; dup {
 			r.planErr = fmt.Errorf("taskrunner: duplicate id in plan: %q", idVal)
-			return
+			break
 		}
 		ids[idVal] = struct{}{}
 		if _, err := stmt.ExecContext(ctx, row...); err != nil {
 			r.planErr = fmt.Errorf("taskrunner: insert items row %q: %w", idVal, err)
-			return
+			break
 		}
-		count++
-	}
-
-	if err := r.cfg.Plan(ctx, emit); err != nil {
-		return fmt.Errorf("taskrunner: plan: %w", err)
 	}
 	if r.planErr != nil {
 		return r.planErr
 	}
 
-	// Seed tasks from items. INSERT OR IGNORE so re-runs on a
-	// partially-seeded DB stay idempotent.
+	// Seed tasks from items. INSERT OR IGNORE for idempotency.
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO tasks (id) SELECT id FROM items`); err != nil {
 		return fmt.Errorf("taskrunner: seed tasks: %w", err)
@@ -219,7 +208,6 @@ func (r *Runner[T]) runPlan(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("taskrunner: plan commit: %w", err)
 	}
-	_ = count
 	return nil
 }
 
@@ -244,8 +232,7 @@ func (s itemSchema) createTableSQL() string {
 	return b.String()
 }
 
-// insertSQL returns `INSERT INTO items(...) VALUES(?,?,...)` for the
-// schema, bound in column order.
+// insertSQL returns `INSERT INTO items(...) VALUES(?,?,...)`.
 func (s itemSchema) insertSQL() string {
 	var cols, vals strings.Builder
 	for i, c := range s.columns {
@@ -275,9 +262,6 @@ func (s itemSchema) bind(v any) ([]any, string, error) {
 	}
 
 	args := make([]any, len(s.columns))
-	// Column → struct field lookup by json tag. We can't assume
-	// struct field index equals column index because some fields are
-	// skipped (json:"-"). Walk the struct and match on tag.
 	tagIdx := make(map[string]int, len(s.columns))
 	for i, c := range s.columns {
 		tagIdx[c.name] = i
@@ -316,8 +300,7 @@ func (s itemSchema) bind(v any) ([]any, string, error) {
 	return args, idStr, nil
 }
 
-// quoteIdent returns a SQLite-safe double-quoted identifier. Embedded
-// double quotes are doubled.
+// quoteIdent returns a SQLite-safe double-quoted identifier.
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }

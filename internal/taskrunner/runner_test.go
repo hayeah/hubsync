@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"iter"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -13,12 +14,12 @@ import (
 
 // echoTask is a minimal Task used by the runner tests. Each Run appends
 // its ID to a shared slice guarded by a mutex; failure / status are
-// toggled via fields set by the Decode callback.
+// toggled via fields set at Hydrate time.
 type echoTask struct {
 	ID   string `json:"id"`
 	Note string `json:"note"`
 
-	// transient — filled by Decode, not in items JSON
+	// transient — filled by Hydrate, not in items JSON
 	ran      *[]string
 	ranMu    *sync.Mutex
 	failOnce map[string]bool
@@ -45,20 +46,75 @@ func (t *echoTask) Run(ctx context.Context) (any, error) {
 	return map[string]any{"note": t.Note}, nil
 }
 
-// decoderFor returns a Decode callback closed over shared test state.
-func decoderFor(ran *[]string, ranMu *sync.Mutex, failOnce map[string]bool, failed *sync.Map) func(map[string]any) (*echoTask, error) {
-	return func(row map[string]any) (*echoTask, error) {
-		id, _ := row["id"].(string)
-		note, _ := row["note"].(string)
-		return &echoTask{
-			ID:       id,
-			Note:     note,
-			ran:      ran,
-			ranMu:    ranMu,
-			failOnce: failOnce,
-			failed:   failed,
-		}, nil
+// echoFactory implements TaskFactory for the echo tests. The plan is
+// provided as a closure; Hydrate returns an echoTask with the shared
+// test-state pointers injected.
+type echoFactory struct {
+	plan     func(yield func(Task, error) bool)
+	ran      *[]string
+	ranMu    *sync.Mutex
+	failOnce map[string]bool
+	failed   *sync.Map
+	sleep    time.Duration
+	// hydrateCount is bumped on every Hydrate call so tests can verify
+	// per-claim allocation.
+	hydrateCount *int64
+}
+
+func (f *echoFactory) List(ctx context.Context) iter.Seq2[Task, error] {
+	return f.plan
+}
+
+func (f *echoFactory) Hydrate(ctx context.Context) (Task, error) {
+	if f.hydrateCount != nil {
+		atomic.AddInt64(f.hydrateCount, 1)
 	}
+	return &echoTask{
+		ran:      f.ran,
+		ranMu:    f.ranMu,
+		failOnce: f.failOnce,
+		failed:   f.failed,
+		sleep:    f.sleep,
+	}, nil
+}
+
+// planOf wraps a plain "emit tasks" closure into the iter.Seq2 shape
+// the factory needs, so each test can write its emit loop tersely.
+func planOf(emit func(yield func(Task) bool)) func(yield func(Task, error) bool) {
+	return func(yield func(Task, error) bool) {
+		emit(func(t Task) bool {
+			return yield(t, nil)
+		})
+	}
+}
+
+// newEchoFactory constructs an echoFactory over the given emit closure
+// and shared state pointers.
+func newEchoFactory(
+	ran *[]string,
+	ranMu *sync.Mutex,
+	failOnce map[string]bool,
+	failed *sync.Map,
+	emit func(yield func(Task) bool),
+) *echoFactory {
+	return &echoFactory{
+		plan:     planOf(emit),
+		ran:      ran,
+		ranMu:    ranMu,
+		failOnce: failOnce,
+		failed:   failed,
+	}
+}
+
+// runnerForEcho constructs a Runner around an echoFactory. Hides the
+// ceremony of wiring shared state + opts.
+func runnerForEcho(t *testing.T, dbPath string, f *echoFactory) *Runner {
+	t.Helper()
+	r, err := New(context.Background(), Config{Factory: f}, RunOptions{DBPath: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 func TestExecute_PlanAndDrain(t *testing.T) {
@@ -66,20 +122,14 @@ func TestExecute_PlanAndDrain(t *testing.T) {
 
 	var ran []string
 	var ranMu sync.Mutex
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			emit(&echoTask{ID: "a", Note: "one"})
-			emit(&echoTask{ID: "b", Note: "two"})
-			emit(&echoTask{ID: "c", Note: "three"})
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newEchoFactory(&ran, &ranMu, nil, nil, func(yield func(Task) bool) {
+		for _, pair := range []struct{ id, note string }{{"a", "one"}, {"b", "two"}, {"c", "three"}} {
+			if !yield(&echoTask{ID: pair.id, Note: pair.note}) {
+				return
+			}
+		}
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	ctx := context.Background()
@@ -125,20 +175,14 @@ func TestExecute_DryIsPlanOnly(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dry.duckdb")
 	var ran []string
 	var ranMu sync.Mutex
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			for _, id := range []string{"x", "y"} {
-				emit(&echoTask{ID: id})
+	f := newEchoFactory(&ran, &ranMu, nil, nil, func(yield func(Task) bool) {
+		for _, id := range []string{"x", "y"} {
+			if !yield(&echoTask{ID: id}) {
+				return
 			}
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+		}
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	if err := r.Execute(context.Background(), RunOptions{Dry: true}); err != nil {
@@ -160,20 +204,14 @@ func TestExecute_WhereSubset(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "where.duckdb")
 	var ran []string
 	var ranMu sync.Mutex
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			for _, id := range []string{"a", "b", "c"} {
-				emit(&echoTask{ID: id, Note: id})
+	f := newEchoFactory(&ran, &ranMu, nil, nil, func(yield func(Task) bool) {
+		for _, id := range []string{"a", "b", "c"} {
+			if !yield(&echoTask{ID: id, Note: id}) {
+				return
 			}
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+		}
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	// Only "a".
@@ -206,18 +244,10 @@ func TestExecute_WhereFalseNoOp(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "false.duckdb")
 	var ran []string
 	var ranMu sync.Mutex
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			emit(&echoTask{ID: "a"})
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newEchoFactory(&ran, &ranMu, nil, nil, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 	if err := r.Execute(context.Background(), RunOptions{Where: "false"}); err != nil {
 		t.Fatal(err)
@@ -234,19 +264,11 @@ func TestExecute_RetryOnFailure(t *testing.T) {
 	var failed sync.Map
 	failOnce := map[string]bool{"a": true}
 
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			emit(&echoTask{ID: "a"})
-			emit(&echoTask{ID: "b"})
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, failOnce, &failed),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newEchoFactory(&ran, &ranMu, failOnce, &failed, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
+		yield(&echoTask{ID: "b"})
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	if err := r.Execute(context.Background(), RunOptions{
@@ -277,18 +299,10 @@ func TestExecute_StaleRunningReclaim(t *testing.T) {
 	var ran []string
 	var ranMu sync.Mutex
 
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			emit(&echoTask{ID: "z"})
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newEchoFactory(&ran, &ranMu, nil, nil, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "z"})
+	})
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	// Plan only (dry so "z" doesn't run), then manually mark it as stale-running.
@@ -325,30 +339,20 @@ func TestExecute_ConcurrentWorkers(t *testing.T) {
 	var ranMu sync.Mutex
 	var counter int64
 
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
+	f := &echoFactory{
+		plan: planOf(func(yield func(Task) bool) {
 			for i := 0; i < 20; i++ {
-				emit(&echoTask{ID: fmt.Sprintf("t%02d", i)})
+				if !yield(&echoTask{ID: fmt.Sprintf("t%02d", i)}) {
+					return
+				}
 			}
-			return nil
-		},
-		Decode: func(row map[string]any) (*echoTask, error) {
-			id, _ := row["id"].(string)
-			t := &echoTask{
-				ID:    id,
-				ran:   &ran,
-				ranMu: &ranMu,
-				sleep: 10 * time.Millisecond,
-			}
-			atomic.AddInt64(&counter, 1)
-			return t, nil
-		},
+		}),
+		ran:          &ran,
+		ranMu:        &ranMu,
+		sleep:        10 * time.Millisecond,
+		hydrateCount: &counter,
 	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	if err := r.Execute(context.Background(), RunOptions{Workers: 8}); err != nil {
@@ -357,17 +361,15 @@ func TestExecute_ConcurrentWorkers(t *testing.T) {
 	if len(ran) != 20 {
 		t.Fatalf("expected 20 runs, got %d", len(ran))
 	}
-	if atomic.LoadInt64(&counter) != 20 {
-		t.Fatalf("decoder not invoked once per row: %d", counter)
+	// Hydrate fires once per claim + once at New (schema-inference probe).
+	if got := atomic.LoadInt64(&counter); got != 21 {
+		t.Fatalf("Hydrate should fire 21x (1 probe + 20 claims), got %d", got)
 	}
 }
 
 // TestExecute_FeedBackpressureDoesNotDeadlock is the regression test
 // for the bug where feedQueue pinned the single DuckDB connection via
-// the rows iterator while pushing into a bounded channel — the first
-// claim UPDATE blocked on the conn, the channel back-pressured, and
-// the whole pipeline hung. With N rows > workers*(buffer+1), the
-// deadlock reliably triggers against the pre-fix feedQueue.
+// the rows iterator while pushing into a bounded channel.
 func TestExecute_FeedBackpressureDoesNotDeadlock(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "backpressure.duckdb")
 
@@ -375,33 +377,24 @@ func TestExecute_FeedBackpressureDoesNotDeadlock(t *testing.T) {
 	var ran []string
 	var ranMu sync.Mutex
 
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
+	f := &echoFactory{
+		plan: planOf(func(yield func(Task) bool) {
 			for i := 0; i < N; i++ {
-				emit(&echoTask{ID: fmt.Sprintf("t%03d", i)})
+				if !yield(&echoTask{ID: fmt.Sprintf("t%03d", i)}) {
+					return
+				}
 			}
-			return nil
-		},
-		Decode: func(row map[string]any) (*echoTask, error) {
-			id, _ := row["id"].(string)
-			return &echoTask{
-				ID:    id,
-				ran:   &ran,
-				ranMu: &ranMu,
-				sleep: 2 * time.Millisecond,
-			}, nil
-		},
+		}),
+		ran:   &ran,
+		ranMu: &ranMu,
+		sleep: 2 * time.Millisecond,
 	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	// 2 workers → channel buffer = 4 → in-flight capacity = 6.
-	// With N=40, feedQueue MUST release the DuckDB conn before
-	// blocking on the channel, or the claim path starves.
+	// With N=40, feedQueue MUST release the conn before blocking on
+	// the channel, or the claim path starves.
 	done := make(chan error, 1)
 	go func() {
 		done <- r.Execute(context.Background(), RunOptions{Workers: 2})
@@ -423,11 +416,8 @@ func TestExecute_FeedBackpressureDoesNotDeadlock(t *testing.T) {
 	}
 }
 
-// TestExecute_ConcurrentReaderSeesProgress opens a second *sql.DB
-// handle against the same file and confirms that task state is visible
-// while Execute is still running. This is the whole point of the
-// SQLite WAL swap: ops can `sqlite3 file.db 'select … from tasks'`
-// mid-run to see progress.
+// TestExecute_ConcurrentReaderSeesProgress confirms WAL allows a
+// second *sql.DB handle to see task state mid-run.
 func TestExecute_ConcurrentReaderSeesProgress(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "concread.duckdb")
 
@@ -435,28 +425,19 @@ func TestExecute_ConcurrentReaderSeesProgress(t *testing.T) {
 	var ran []string
 	var ranMu sync.Mutex
 
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
+	f := &echoFactory{
+		plan: planOf(func(yield func(Task) bool) {
 			for i := 0; i < N; i++ {
-				emit(&echoTask{ID: fmt.Sprintf("t%02d", i)})
+				if !yield(&echoTask{ID: fmt.Sprintf("t%02d", i)}) {
+					return
+				}
 			}
-			return nil
-		},
-		Decode: func(row map[string]any) (*echoTask, error) {
-			id, _ := row["id"].(string)
-			return &echoTask{
-				ID:    id,
-				ran:   &ran,
-				ranMu: &ranMu,
-				sleep: 50 * time.Millisecond,
-			}, nil
-		},
+		}),
+		ran:   &ran,
+		ranMu: &ranMu,
+		sleep: 50 * time.Millisecond,
 	}
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := runnerForEcho(t, dbPath, f)
 	defer r.Close()
 
 	execDone := make(chan error, 1)
@@ -464,10 +445,6 @@ func TestExecute_ConcurrentReaderSeesProgress(t *testing.T) {
 		execDone <- r.Execute(context.Background(), RunOptions{Workers: 2})
 	}()
 
-	// A second handle — i.e. what `sqlite3` or another process would
-	// see. Poll until at least one row has flipped to done, with a
-	// deadline short enough to fail fast if WAL isn't actually serving
-	// concurrent reads.
 	readerDB, err := sql.Open("sqlite", sqliteDSN(dbPath))
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +470,6 @@ func TestExecute_ConcurrentReaderSeesProgress(t *testing.T) {
 		t.Fatal("second handle never saw a 'done' task while writer was running (WAL concurrency broken?)")
 	}
 
-	// Let the run finish.
 	if err := <-execDone; err != nil {
 		t.Fatalf("execute: %v", err)
 	}

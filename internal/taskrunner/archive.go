@@ -20,11 +20,11 @@ const archiveTimestampLayout = "2006-01-02T150405Z"
 // error when archiving does not apply (in-memory DB, KeepDB set, or
 // residual work in the queue). Idempotent: losing a rename race against
 // another process that already moved the file is treated as success.
-func (r *Runner[T]) archiveIfDrained(ctx context.Context, opts RunOptions) error {
+func (r *Runner) archiveIfDrained(ctx context.Context, opts RunOptions) error {
 	if opts.KeepDB {
 		return nil
 	}
-	if r.cfg.DBPath == "" {
+	if r.dbPath == "" {
 		// In-memory DB — nothing to rename. Archive-on-success has no
 		// meaning without a file path.
 		return nil
@@ -47,7 +47,7 @@ func (r *Runner[T]) archiveIfDrained(ctx context.Context, opts RunOptions) error
 		return fmt.Errorf("taskrunner: close before archive: %w", err)
 	}
 
-	src := r.cfg.DBPath
+	src := r.dbPath
 	dst := archiveDestPath(src, time.Now().UTC())
 
 	if err := os.Rename(src, dst); err != nil {
