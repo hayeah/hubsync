@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,34 +16,25 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Config wires up a domain type T to the runner. Plan is called exactly
-// when items is empty (first invocation or after a manual wipe); Decode
-// is called on every row the claim loop picks up.
-type Config[T Task] struct {
+// Config wires a TaskFactory to the runner. Non-generic so future
+// additions (e.g. a Docstring template) land without re-parametrizing.
+type Config struct {
+	// Factory supplies both the plan-time emitter (List) and the
+	// per-claim allocator (Hydrate). Required.
+	Factory TaskFactory
+}
+
+// RunOptions tunes a single run. DBPath lives here (not on Config)
+// because it's a runtime knob owned by --resume.
+type RunOptions struct {
 	// DBPath is the SQLite file path. Empty uses an in-memory database.
 	// The file is opened in WAL journal mode so external readers (e.g.
 	// `sqlite3 file.db "select … from tasks"`) can observe task state
 	// while a writer is running.
-	DBPath string
-
-	// Plan emits one T per unit of work. The runner reflects on T's
-	// struct tags to build a typed items table (with columns derived
-	// from `json:"…"` tags) and streams each emitted row through a
-	// prepared INSERT. Every emitted row must carry a non-empty `id`
-	// field (the `id` JSON tag); id becomes items' PRIMARY KEY.
-	Plan func(ctx context.Context, emit func(T)) error
-
-	// Decode turns one items row into a runnable T. The row map contains
-	// all columns (items joined with tasks — but the project code only
-	// needs the items fields). The runner passes the same transient
-	// dependencies the caller closed over in Plan; in practice both Plan
-	// and Decode are constructed with the same *HubStore / storage
-	// client pointer in scope.
-	Decode func(row map[string]any) (T, error)
-}
-
-// RunOptions tunes a single Execute call.
-type RunOptions struct {
+	//
+	// New reads this at construction time; Execute ignores it
+	// (reconfiguring the DB mid-Runner is not supported).
+	DBPath         string
 	Workers        int           // default runtime.NumCPU()
 	Where          string        // SQL fragment AND-combined with work-queue predicate
 	MaxAttempts    int           // default 3
@@ -49,49 +42,47 @@ type RunOptions struct {
 	HeartbeatEvery time.Duration // default 5s
 	Dry            bool          // plan-if-empty, don't run
 
-	// KeepDB disables the default archive-on-success behavior. When false
-	// (the default) and Execute drains the queue cleanly with zero
-	// remaining pending/failed/running rows, the DB file is closed and
-	// renamed in place with a UTC ISO-8601 timestamp prefix so the next
-	// invocation at the canonical path plans from scratch. Set KeepDB
-	// to preserve same-path resume semantics.
+	// KeepDB disables archive-on-success. When false (default) and
+	// Execute drains cleanly with zero remaining pending/failed/running
+	// rows, the DB file is closed and renamed in place with a UTC
+	// ISO-8601 timestamp prefix so the next invocation at the canonical
+	// path plans from scratch. Set KeepDB to preserve same-path resume
+	// semantics.
 	KeepDB bool
 }
 
-// Runner owns the DB handle and serialized-write mutex.
-type Runner[T Task] struct {
-	cfg Config[T]
-	db  *sql.DB
+// Runner owns the DB handle, the cached item schema, and the
+// serialized-write mutex.
+type Runner struct {
+	cfg    Config
+	dbPath string // captured from opts at New time; archiveIfDrained needs it
+	db     *sql.DB
+	schema itemSchema // cached at New; used by plan + hydrate paths
 
-	// writeMu serializes writing statements within this process. SQLite in
-	// WAL mode allows concurrent readers with a single writer; busy_timeout
-	// absorbs cross-process contention, and writeMu spares us from that
-	// retry loop for intra-process writes (claim / heartbeat / terminal).
+	// writeMu serializes writes within this process. SQLite in WAL mode
+	// allows concurrent readers with a single writer; busy_timeout
+	// absorbs cross-process contention, and writeMu spares intra-process
+	// writes from that retry loop.
 	writeMu sync.Mutex
 
-	// planErr captures the first error seen during the emit callback.
+	// planErr captures the first error observed during the plan loop
+	// (bind / INSERT failures; wrong-type yields).
 	planErr error
 
 	// closed guards against double-close after archive-on-success already
-	// closed the handle — callers still run `defer r.Close()` and would
-	// otherwise hit the driver's closed-database error.
+	// closed the handle.
 	closed bool
 
 	// archivedPath is set by archiveIfDrained after a successful rename.
-	// "" means no archive happened (KeepDB, in-memory DB, or queue not
-	// fully drained).
 	archivedPath string
 
-	// summary is the last-observed snapshot of the tasks table, captured
-	// at the end of Execute (after drain, before any archive-induced
-	// close). Callers that want to log a one-line status or exit non-
-	// zero on residual failures read it via Summary().
+	// summary is the last-observed tasks-table snapshot, captured at the
+	// end of Execute so callers that want a terminal status line can
+	// read it even after archive-on-success has closed the DB.
 	summary Summary
 }
 
-// Summary is a snapshot of the tasks table grouped by status. Populated
-// at the end of Execute; read via Runner.Summary(). Zero-valued on
-// Runners that haven't Execute'd yet.
+// Summary is a snapshot of the tasks table grouped by status.
 type Summary struct {
 	Pending int
 	Running int
@@ -99,32 +90,67 @@ type Summary struct {
 	Failed  int
 }
 
-// New opens the SQLite database in WAL mode and ensures the tasks/runs
-// tables exist. The items table is created lazily on first plan.
-func New[T Task](cfg Config[T]) (*Runner[T], error) {
-	if cfg.Plan == nil {
-		return nil, errors.New("taskrunner: Config.Plan is required")
+// RunResult is the return value of Run. Zero-valued on setup errors
+// (where Run couldn't open the DB or probe the factory).
+type RunResult struct {
+	Summary      Summary
+	ArchivedPath string
+}
+
+// Error sentinels. Callers branch on these via errors.Is:
+//
+//   - ErrSetup wraps errors encountered before Execute starts (DB open,
+//     schema inference, factory.Hydrate probe). Main maps this to exit 2.
+//   - ErrFailedRemain is returned from Run on a clean drain where the
+//     tasks table still has rows in terminal 'failed' status. Main maps
+//     this to exit 1.
+var (
+	ErrSetup        = errors.New("taskrunner: setup failed")
+	ErrFailedRemain = errors.New("taskrunner: failed row(s) remain")
+)
+
+// attemptsColumn is the alias the feed-query uses for tasks.attempts so
+// it never collides with a user-side items column named `attempts`.
+// The double-underscore prefix is a sentinel — user Task types must not
+// emit a JSON tag starting with `__tr_`.
+const attemptsColumn = "__tr_attempts"
+
+// New opens the SQLite DB, probes the factory to infer the items
+// schema, and returns a Runner ready for Execute. Callers that only
+// want the packaged run-loop should prefer Run.
+//
+// The factory.Hydrate(ctx) probe at New time is how we cache the items
+// schema; implementations that require a fully-populated ctx for that
+// call can either pass the caller's ctx through or (typical case)
+// return a bare struct with deps pre-wired and ignore ctx.
+func New(ctx context.Context, cfg Config, opts RunOptions) (*Runner, error) {
+	if cfg.Factory == nil {
+		return nil, fmt.Errorf("%w: Config.Factory is required", ErrSetup)
 	}
-	if cfg.Decode == nil {
-		return nil, errors.New("taskrunner: Config.Decode is required")
+	sample, err := cfg.Factory.Hydrate(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: factory.Hydrate probe: %w", ErrSetup, err)
 	}
-	dsn := sqliteDSN(cfg.DBPath)
+	schema, err := inferItemSchema(sample)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrSetup, err)
+	}
+	dsn := sqliteDSN(opts.DBPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("taskrunner: open %s: %w", cfg.DBPath, err)
+		return nil, fmt.Errorf("%w: open %s: %w", ErrSetup, opts.DBPath, err)
 	}
 	if err := ensureTasksTable(db); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrSetup, err)
 	}
-	return &Runner[T]{cfg: cfg, db: db}, nil
+	return &Runner{cfg: cfg, dbPath: opts.DBPath, db: db, schema: schema}, nil
 }
 
 // sqliteDSN builds a modernc.org/sqlite DSN that enables WAL, a 5s
-// busy_timeout (so concurrent writers backoff instead of erroring), and
-// foreign_keys (harmless here, sane default). An empty path maps to an
-// in-memory DB that is also shared-cache so multiple *sql.DB handles
-// from the same process can see the same data during tests.
+// busy_timeout, and foreign_keys. An empty path maps to a shared-cache
+// in-memory DB so multiple *sql.DB handles from the same process see
+// the same data during tests.
 func sqliteDSN(path string) string {
 	const pragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
 	if path == "" {
@@ -133,10 +159,8 @@ func sqliteDSN(path string) string {
 	return "file:" + path + "?" + pragmas
 }
 
-// Close releases the DB handle. Idempotent: calling Close twice (the
-// second time via the caller's `defer r.Close()` after archive-on-success
-// already closed) is a no-op.
-func (r *Runner[T]) Close() error {
+// Close releases the DB handle. Idempotent.
+func (r *Runner) Close() error {
 	if r.closed {
 		return nil
 	}
@@ -144,20 +168,73 @@ func (r *Runner[T]) Close() error {
 	return r.db.Close()
 }
 
-// ArchivedPath returns the destination path of the archived DB if
-// Execute's drain completed with an empty queue and KeepDB was false.
-// Returns "" when no archive happened (KeepDB, in-memory DB, remaining
-// work, or a concurrent process won the rename race).
-func (r *Runner[T]) ArchivedPath() string { return r.archivedPath }
+// ArchivedPath returns the destination of the archived DB if Execute's
+// drain completed with an empty queue and KeepDB was false.
+func (r *Runner) ArchivedPath() string { return r.archivedPath }
 
 // Summary returns the last-observed tasks-table snapshot captured at
-// the end of Execute. Safe to call after archive-on-success has closed
-// the underlying DB handle.
-func (r *Runner[T]) Summary() Summary { return r.summary }
+// the end of Execute.
+func (r *Runner) Summary() Summary { return r.summary }
+
+// DB exposes the underlying handle for tests and introspection.
+// Writes should still go through the runner's mutex.
+func (r *Runner) DB() *sql.DB { return r.db }
+
+// Run is the packaged entry point: New → Execute → capture summary →
+// Close. Does not install signal handlers; does not call os.Exit.
+// Caller owns both.
+//
+// Error composition:
+//   - Setup failures wrap ErrSetup and are returned with zero RunResult.
+//   - Execute errors return wrapped err with populated RunResult.
+//   - A clean drain with Summary.Failed > 0 returns ErrFailedRemain
+//     with populated RunResult.
+//   - A clean drain with no failures returns nil.
+func Run(ctx context.Context, cfg Config, opts RunOptions) (RunResult, error) {
+	r, err := New(ctx, cfg, opts)
+	if err != nil {
+		return RunResult{}, err
+	}
+	defer r.Close()
+
+	execErr := r.Execute(ctx, opts)
+
+	result := RunResult{
+		Summary:      r.Summary(),
+		ArchivedPath: r.ArchivedPath(),
+	}
+	if execErr != nil {
+		return result, execErr
+	}
+	if result.Summary.Failed > 0 {
+		return result, ErrFailedRemain
+	}
+	return result, nil
+}
+
+// BindFlags binds the taskrunner's flags onto fs and returns the
+// RunOptions the caller reads after fs.Parse. Callers may add their
+// own flags to the same fs before parsing.
+//
+// Bound flags: --resume (→ DBPath), --where, --dry, --workers,
+// --max-attempts, --stale, --heartbeat, --keep-db.
+func BindFlags(fs *flag.FlagSet) *RunOptions {
+	var opts RunOptions
+	fs.StringVar(&opts.DBPath, "resume", "", "path to the SQLite task-state file (empty → in-memory)")
+	fs.StringVar(&opts.Where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
+	fs.BoolVar(&opts.Dry, "dry", false, "plan-if-needed, do not run any tasks")
+	fs.IntVar(&opts.Workers, "workers", 0, "number of workers (default: runtime.NumCPU())")
+	fs.IntVar(&opts.MaxAttempts, "max-attempts", 3, "retry ceiling for failed rows")
+	fs.DurationVar(&opts.Stale, "stale", 30*time.Second, "running-row heartbeat staleness threshold")
+	fs.DurationVar(&opts.HeartbeatEvery, "heartbeat", 5*time.Second, "heartbeat / Status() poll interval")
+	fs.BoolVar(&opts.KeepDB, "keep-db", false, "do not rename the DB file after a successful drain (default: archive in place)")
+	return &opts
+}
 
 // Execute is the one-verb operation: plan-if-needed, select unfinished
-// rows (+ user --where), and drain them through a worker pool.
-func (r *Runner[T]) Execute(ctx context.Context, opts RunOptions) error {
+// rows (+ user --where), and drain them through a worker pool. The
+// DBPath field on opts is ignored — that path is captured at New time.
+func (r *Runner) Execute(ctx context.Context, opts RunOptions) error {
 	opts = opts.withDefaults()
 
 	empty, err := itemsEmpty(r.db)
@@ -188,7 +265,7 @@ func (r *Runner[T]) Execute(ctx context.Context, opts RunOptions) error {
 // captureSummary reads the final tasks-table counts and stashes them on
 // the runner so callers can read them even after archive-on-success has
 // closed the DB handle.
-func (r *Runner[T]) captureSummary(ctx context.Context) error {
+func (r *Runner) captureSummary(ctx context.Context) error {
 	var s Summary
 	err := r.db.QueryRowContext(ctx,
 		`SELECT
@@ -222,7 +299,7 @@ func (o RunOptions) withDefaults() RunOptions {
 
 // drain picks unfinished rows in batches, feeds them to the worker pool,
 // and returns when the queue empties (or ctx cancels).
-func (r *Runner[T]) drain(ctx context.Context, opts RunOptions) error {
+func (r *Runner) drain(ctx context.Context, opts RunOptions) error {
 	queue := make(chan map[string]any, opts.Workers*2)
 	var wg sync.WaitGroup
 	wg.Add(opts.Workers)
@@ -267,14 +344,21 @@ func (r *Runner[T]) drain(ctx context.Context, opts RunOptions) error {
 // feedQueue re-scans the work queue in passes until no new row is
 // eligible. Dedup is by (id, attempts): we only emit a row again once
 // its attempts counter has bumped (i.e. a previous attempt completed
-// and terminal-wrote 'failed'). This both prevents double-queuing
-// while workers are still running an attempt AND allows in-Execute
-// retries for failed rows with attempts<max.
-func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<- map[string]any) error {
+// and terminal-wrote 'failed').
+//
+// The SELECT is explicit (items.* plus the single tasks column we
+// actually read) to avoid a column-name collision when the user's Task
+// struct shadows a tasks-table name like `meta`, `status`, `attempts`.
+// Under `SELECT *` on a JOIN-USING, SQLite surfaces both sides and the
+// row-map assignment silently overwrote items columns with tasks values.
+func (r *Runner) feedQueue(ctx context.Context, opts RunOptions, queue chan<- map[string]any) error {
 	where := r.workQueueWhere(opts)
 	query := fmt.Sprintf(
-		`SELECT * FROM items JOIN tasks USING (id) WHERE %s ORDER BY id`,
-		where,
+		`SELECT items.*, tasks.attempts AS %s
+		   FROM items JOIN tasks USING (id)
+		  WHERE %s
+		  ORDER BY items.id`,
+		attemptsColumn, where,
 	)
 	seen := map[string]int64{}
 
@@ -309,11 +393,9 @@ func (r *Runner[T]) feedQueue(ctx context.Context, opts RunOptions, queue chan<-
 	}
 }
 
-// fetchBatch runs one work-queue select and returns the rows that passed
-// the (id, attempts) dedup. The DuckDB conn is released before return,
-// so callers are free to push into a bounded channel without risking
-// starving the claim UPDATEs.
-func (r *Runner[T]) fetchBatch(ctx context.Context, query string, seen map[string]int64) ([]map[string]any, error) {
+// fetchBatch runs one work-queue select and returns rows that passed
+// the (id, attempts) dedup.
+func (r *Runner) fetchBatch(ctx context.Context, query string, seen map[string]int64) ([]map[string]any, error) {
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("taskrunner: select work queue: %w", err)
@@ -340,11 +422,16 @@ func (r *Runner[T]) fetchBatch(ctx context.Context, query string, seen map[strin
 			row[name] = raw[i]
 		}
 		id, _ := row["id"].(string)
-		attempts := asInt64FromAny(row["attempts"])
+		attempts := asInt64FromAny(row[attemptsColumn])
 		if prev, ok := seen[id]; ok && attempts <= prev {
 			continue
 		}
 		seen[id] = attempts
+		// Strip the sentinel so downstream (hydrate's row-to-JSON build)
+		// doesn't see it. schema.columns already filters hydrate's
+		// iteration, but dropping it keeps the row map tidy for any
+		// future consumer.
+		delete(row, attemptsColumn)
 		batch = append(batch, row)
 	}
 	if err := rows.Err(); err != nil {
@@ -353,8 +440,7 @@ func (r *Runner[T]) fetchBatch(ctx context.Context, query string, seen map[strin
 	return batch, nil
 }
 
-// asInt64FromAny coerces a DuckDB row column value into int64 for the
-// attempts field. DuckDB returns INTEGER as int32 via the go driver.
+// asInt64FromAny coerces a column value into int64 for attempts.
 func asInt64FromAny(v any) int64 {
 	switch x := v.(type) {
 	case int64:
@@ -374,10 +460,8 @@ func asInt64FromAny(v any) int64 {
 	}
 }
 
-// workQueueWhere returns the unified WHERE fragment (built-in predicate
-// AND user --where). Reserved state-column names in tasks prevent name
-// collisions with items.
-func (r *Runner[T]) workQueueWhere(opts RunOptions) string {
+// workQueueWhere returns the unified WHERE fragment.
+func (r *Runner) workQueueWhere(opts RunOptions) string {
 	builtin := fmt.Sprintf(
 		`(status='pending'
 		   OR (status='failed'  AND attempts<%d)
@@ -391,9 +475,9 @@ func (r *Runner[T]) workQueueWhere(opts RunOptions) string {
 	return fmt.Sprintf("%s AND (%s)", builtin, opts.Where)
 }
 
-// processRow claims one row, runs the task (with heartbeat), and writes
-// the terminal status.
-func (r *Runner[T]) processRow(ctx context.Context, row map[string]any, opts RunOptions) error {
+// processRow claims one row, hydrates it into a Task, runs it (with
+// heartbeat), and writes the terminal status.
+func (r *Runner) processRow(ctx context.Context, row map[string]any, opts RunOptions) error {
 	id, _ := row["id"].(string)
 	if id == "" {
 		return fmt.Errorf("taskrunner: row missing id")
@@ -404,13 +488,12 @@ func (r *Runner[T]) processRow(ctx context.Context, row map[string]any, opts Run
 		return err
 	}
 	if !claimed {
-		// Another worker / another process grabbed it first.
 		return nil
 	}
 
-	task, decodeErr := r.cfg.Decode(row)
-	if decodeErr != nil {
-		return r.writeTerminal(ctx, id, "failed", fmt.Errorf("decode: %w", decodeErr), nil)
+	task, hydrateErr := r.hydrate(ctx, row)
+	if hydrateErr != nil {
+		return r.writeTerminal(ctx, id, "failed", fmt.Errorf("decode: %w", hydrateErr), nil)
 	}
 
 	// Heartbeat goroutine lives for the duration of Run.
@@ -433,9 +516,46 @@ func (r *Runner[T]) processRow(ctx context.Context, row map[string]any, opts Run
 	return r.writeTerminal(ctx, id, "done", nil, result)
 }
 
-// claim atomically flips an eligible row to 'running', bumping attempts.
-// Returns true if the UPDATE touched a row (we own the lease).
-func (r *Runner[T]) claim(ctx context.Context, id string, opts RunOptions) (bool, error) {
+// hydrate calls factory.Hydrate(ctx), then json-round-trips the items
+// row into the returned Task. Complex columns stored as TEXT-of-JSON
+// are re-wrapped as json.RawMessage so they unmarshal as structured
+// values rather than re-wrapping as JSON-inside-a-string.
+func (r *Runner) hydrate(ctx context.Context, row map[string]any) (Task, error) {
+	task, err := r.cfg.Factory.Hydrate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	obj := make(map[string]any, len(r.schema.columns))
+	for _, c := range r.schema.columns {
+		v, ok := row[c.name]
+		if !ok || v == nil {
+			continue
+		}
+		if c.isJSON {
+			switch x := v.(type) {
+			case string:
+				obj[c.name] = json.RawMessage(x)
+			case []byte:
+				obj[c.name] = json.RawMessage(x)
+			default:
+				obj[c.name] = v
+			}
+		} else {
+			obj[c.name] = v
+		}
+	}
+	buf, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("marshal row: %w", err)
+	}
+	if err := json.Unmarshal(buf, task); err != nil {
+		return nil, fmt.Errorf("unmarshal into task: %w", err)
+	}
+	return task, nil
+}
+
+// claim atomically flips an eligible row to 'running'.
+func (r *Runner) claim(ctx context.Context, id string, opts RunOptions) (bool, error) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
@@ -465,16 +585,16 @@ func (r *Runner[T]) claim(ctx context.Context, id string, opts RunOptions) (bool
 	return n > 0, nil
 }
 
-// heartbeatLoop refreshes heartbeat_at on a ticker. If T implements
-// StatusReporter, the snapshot is merged into meta.status.
-func (r *Runner[T]) heartbeatLoop(ctx context.Context, id string, task T, every time.Duration) {
+// heartbeatLoop refreshes heartbeat_at on a ticker. StatusReporter is
+// probed via type assertion.
+func (r *Runner) heartbeatLoop(ctx context.Context, id string, task Task, every time.Duration) {
 	if every <= 0 {
 		every = 5 * time.Second
 	}
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 
-	reporter, hasStatus := any(task).(StatusReporter)
+	reporter, hasStatus := task.(StatusReporter)
 
 	for {
 		select {
@@ -493,7 +613,7 @@ func (r *Runner[T]) heartbeatLoop(ctx context.Context, id string, task T, every 
 	}
 }
 
-func (r *Runner[T]) beat(ctx context.Context, id string, status any) {
+func (r *Runner) beat(ctx context.Context, id string, status any) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
@@ -514,9 +634,8 @@ func (r *Runner[T]) beat(ctx context.Context, id string, status any) {
 		string(buf), id)
 }
 
-// writeTerminal commits 'done' or 'failed' for a task and the optional
-// result / error string.
-func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr error, result any) error {
+// writeTerminal commits 'done' or 'failed' for a task.
+func (r *Runner) writeTerminal(ctx context.Context, id, status string, runErr error, result any) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
@@ -525,7 +644,6 @@ func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr
 		if result != nil {
 			buf, err := json.Marshal(result)
 			if err != nil {
-				// Record the marshal error as a failure instead of claiming success.
 				status = "failed"
 				runErr = fmt.Errorf("marshal result: %w", err)
 			} else {
@@ -551,7 +669,6 @@ func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr
 		}
 	}
 
-	// failed path
 	msg := ""
 	if runErr != nil {
 		msg = runErr.Error()
@@ -570,8 +687,6 @@ func (r *Runner[T]) writeTerminal(ctx context.Context, id, status string, runErr
 	return nil
 }
 
-// nullIfEmpty returns sql.NullString so DuckDB binds NULL for an empty
-// Go string (needed for the CASE WHEN NULL branch above).
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
@@ -579,8 +694,5 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
-// DB exposes the underlying handle for callers that need ad-hoc queries
-// (tests, introspection). Writes should still go through the runner's
-// own mutex; callers doing raw writes must handle their own
-// serialization.
-func (r *Runner[T]) DB() *sql.DB { return r.db }
+// schemaType is exposed for the plan-loop's emit-type validation.
+func (r *Runner) schemaType() reflect.Type { return r.schema.schemaType }

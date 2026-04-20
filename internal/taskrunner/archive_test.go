@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,35 +18,28 @@ import (
 // drain. Kept narrow so a stray stamp format change surfaces loudly.
 var archiveFilename = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{6}Z-archive\.sqlite$`)
 
-func newEchoRunner(t *testing.T, dbPath string, plan func(emit func(*echoTask))) (*Runner[*echoTask], *[]string, *sync.Mutex) {
+// newArchiveEchoRunner wires an echoFactory + Runner for archive-flow
+// tests. Returns the runner plus the ran/ranMu pair for assertion.
+func newArchiveEchoRunner(t *testing.T, dbPath string, emit func(yield func(Task) bool)) (*Runner, *[]string, *sync.Mutex) {
 	t.Helper()
 	var ran []string
 	var ranMu sync.Mutex
-	cfg := Config[*echoTask]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*echoTask)) error {
-			plan(emit)
-			return nil
-		},
-		Decode: decoderFor(&ran, &ranMu, nil, nil),
-	}
-	r, err := New(cfg)
+	f := newEchoFactory(&ran, &ranMu, nil, nil, emit)
+	r, err := New(context.Background(), Config{Factory: f}, RunOptions{DBPath: dbPath})
 	if err != nil {
 		t.Fatalf("new runner: %v", err)
 	}
 	return r, &ran, &ranMu
 }
 
-// TestArchive_DefaultMovesOnSuccess is the happy path: Execute drains
-// cleanly, the DB file is renamed with the UTC timestamp prefix, the
-// original path is gone, and the WAL sidecars are not left behind.
+// TestArchive_DefaultMovesOnSuccess is the happy path.
 func TestArchive_DefaultMovesOnSuccess(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "archive.sqlite")
 
-	r, _, _ := newEchoRunner(t, dbPath, func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
-		emit(&echoTask{ID: "b"})
+	r, _, _ := newArchiveEchoRunner(t, dbPath, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
+		yield(&echoTask{ID: "b"})
 	})
 	defer r.Close()
 
@@ -71,7 +65,6 @@ func TestArchive_DefaultMovesOnSuccess(t *testing.T) {
 	if !archiveFilename.MatchString(base) {
 		t.Fatalf("archived basename %q does not match timestamp pattern", base)
 	}
-	// Timestamp in the filename should fall in [before, after].
 	stamp := base[:len("2006-01-02T150405Z")]
 	got, err := time.Parse("2006-01-02T150405Z", stamp)
 	if err != nil {
@@ -81,30 +74,25 @@ func TestArchive_DefaultMovesOnSuccess(t *testing.T) {
 		t.Errorf("stamp %v out of bounds [%v, %v]", got, before, after)
 	}
 
-	// Sidecars must be gone from the canonical path so a fresh
-	// invocation doesn't trip over stragglers.
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if _, err := os.Stat(dbPath + suffix); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("leftover sidecar %s%s: %v", dbPath, suffix, err)
 		}
 	}
 
-	// Summary must reflect the drained state for callers that already
-	// closed the DB via archive.
 	s := r.Summary()
 	if s.Done != 2 || s.Pending != 0 || s.Running != 0 || s.Failed != 0 {
 		t.Errorf("unexpected summary: %+v", s)
 	}
 }
 
-// TestArchive_KeepDBOptOut: --keep-db preserves same-path resume
-// semantics — the DB stays put.
+// TestArchive_KeepDBOptOut: --keep-db preserves same-path resume semantics.
 func TestArchive_KeepDBOptOut(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "archive.sqlite")
 
-	r, _, _ := newEchoRunner(t, dbPath, func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
+	r, _, _ := newArchiveEchoRunner(t, dbPath, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
 	})
 	defer r.Close()
 
@@ -120,25 +108,13 @@ func TestArchive_KeepDBOptOut(t *testing.T) {
 }
 
 // TestArchive_FailedRowsStay: with tasks remaining in 'failed'
-// (retries exhausted), archive MUST NOT move the DB — the file's
-// value is that a resume from the same path is meaningful.
+// (retries exhausted), archive MUST NOT move the DB.
 func TestArchive_FailedRowsStay(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "archive.sqlite")
 
-	// alwaysFail: task that unconditionally errors.
-	cfg := Config[*alwaysFail]{
-		DBPath: dbPath,
-		Plan: func(ctx context.Context, emit func(*alwaysFail)) error {
-			emit(&alwaysFail{ID: "bad"})
-			return nil
-		},
-		Decode: func(row map[string]any) (*alwaysFail, error) {
-			id, _ := row["id"].(string)
-			return &alwaysFail{ID: id}, nil
-		},
-	}
-	r, err := New(cfg)
+	f := &alwaysFailFactory{}
+	r, err := New(context.Background(), Config{Factory: f}, RunOptions{DBPath: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,11 +135,10 @@ func TestArchive_FailedRowsStay(t *testing.T) {
 	}
 }
 
-// TestArchive_InMemorySkips: in-memory runners have no file to move;
-// archive must be a silent no-op, not an error.
+// TestArchive_InMemorySkips: in-memory runners have no file to move.
 func TestArchive_InMemorySkips(t *testing.T) {
-	r, _, _ := newEchoRunner(t, "", func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
+	r, _, _ := newArchiveEchoRunner(t, "", func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
 	})
 	defer r.Close()
 
@@ -175,15 +150,14 @@ func TestArchive_InMemorySkips(t *testing.T) {
 	}
 }
 
-// TestArchive_DrainedDBGoneNextPlanRuns: the whole point of the feature
-// — archiving leaves the canonical path clean, and a subsequent Runner
-// opened against the same path plans fresh and drains again.
+// TestArchive_DrainedDBGoneNextPlanRuns: archiving leaves the canonical
+// path clean, and a subsequent Runner against the same path plans fresh.
 func TestArchive_DrainedDBGoneNextPlanRuns(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "archive.sqlite")
 
-	r1, ran1, _ := newEchoRunner(t, dbPath, func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
+	r1, ran1, _ := newArchiveEchoRunner(t, dbPath, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
 	})
 	if err := r1.Execute(context.Background(), RunOptions{Workers: 1}); err != nil {
 		t.Fatalf("first execute: %v", err)
@@ -196,10 +170,8 @@ func TestArchive_DrainedDBGoneNextPlanRuns(t *testing.T) {
 	}
 	_ = r1.Close()
 
-	// Second runner at the same canonical path — DB must be absent,
-	// Plan runs again, task executes again.
-	r2, ran2, _ := newEchoRunner(t, dbPath, func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
+	r2, ran2, _ := newArchiveEchoRunner(t, dbPath, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
 	})
 	defer r2.Close()
 	if err := r2.Execute(context.Background(), RunOptions{Workers: 1}); err != nil {
@@ -216,20 +188,18 @@ func TestArchive_CloseIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "archive.sqlite")
 
-	r, _, _ := newEchoRunner(t, dbPath, func(emit func(*echoTask)) {
-		emit(&echoTask{ID: "a"})
+	r, _, _ := newArchiveEchoRunner(t, dbPath, func(yield func(Task) bool) {
+		yield(&echoTask{ID: "a"})
 	})
 	if err := r.Execute(context.Background(), RunOptions{Workers: 1}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// First Close inside archiveIfDrained already ran; this one must be a no-op.
 	if err := r.Close(); err != nil {
 		t.Errorf("second Close errored: %v", err)
 	}
 }
 
-// TestArchive_DestPathComposition pins the filename format to the
-// documented layout so a stray time.Format change surfaces loudly.
+// TestArchive_DestPathComposition pins the filename format.
 func TestArchive_DestPathComposition(t *testing.T) {
 	src := "/tmp/x/archive.sqlite"
 	stamp := time.Date(2026, 4, 19, 14, 35, 22, 0, time.UTC)
@@ -240,12 +210,23 @@ func TestArchive_DestPathComposition(t *testing.T) {
 	}
 }
 
-// alwaysFail is a Task that unconditionally errors. Used to verify
-// the failed-rows-stay invariant.
+// alwaysFail is a Task that unconditionally errors.
 type alwaysFail struct {
 	ID string `json:"id"`
 }
 
 func (a *alwaysFail) Run(ctx context.Context) (any, error) {
 	return nil, fmt.Errorf("boom")
+}
+
+// alwaysFailFactory plans a single alwaysFail task.
+type alwaysFailFactory struct{}
+
+func (f *alwaysFailFactory) List(ctx context.Context) iter.Seq2[Task, error] {
+	return func(yield func(Task, error) bool) {
+		yield(&alwaysFail{ID: "bad"}, nil)
+	}
+}
+func (f *alwaysFailFactory) Hydrate(ctx context.Context) (Task, error) {
+	return &alwaysFail{}, nil
 }

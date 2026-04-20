@@ -218,18 +218,17 @@ func TestArchiveOneShot_EndToEnd(t *testing.T) {
 		HubDir:  hubDir,
 		Prefix:  "oneshot/",
 	}
-	runner, err := taskrunner.New(taskrunner.Config[*ArchiveTask]{
-		DBPath: filepath.Join(hubDir, ".hubsync", "archive.duckdb"),
-		Plan:   PlanArchiveTasks(deps),
-		Decode: DecodeArchiveTask(deps),
-	})
+	dbOpts := taskrunner.RunOptions{DBPath: filepath.Join(hubDir, ".hubsync", "archive.duckdb")}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runner, err := taskrunner.New(ctx, taskrunner.Config{
+		Factory: NewArchiveTaskFactory(deps),
+	}, dbOpts)
 	if err != nil {
 		t.Fatalf("taskrunner: %v", err)
 	}
 	defer runner.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	// KeepDB: archive-on-success would close the handle; this test's
 	// second-Execute-on-same-runner idempotency check below needs the
 	// DB to stay open.
